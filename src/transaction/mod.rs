@@ -13,6 +13,7 @@ pub struct AsyncTx<F>
 where
     F: Future,
 {
+    priority: usize,
     future: F,
     started: bool,
     context: Option<TxContext>,
@@ -22,12 +23,17 @@ impl<F> AsyncTx<F>
 where
     F: Future,
 {
-    pub fn new(future: F) -> Self {
+    pub fn with_priority(future: F, priority: usize) -> Self {
         Self {
             future,
+            priority,
             started: false,
             context: None,
         }
+    }
+
+    pub fn new(future: F) -> Self {
+        Self::with_priority(future, 0)
     }
 
     fn future(self: Pin<&mut Self>) -> Pin<&mut F> {
@@ -53,7 +59,7 @@ where
         // insert new ctx
         let ctx = if !*self.as_mut().started() {
             *self.as_mut().started() = true;
-            TxContext::new()
+            TxContext::new(self.priority)
         } else {
             self.as_mut()
                 .context()
@@ -111,7 +117,7 @@ macro_rules! async_tx {
         loop {
             $(
                 let mut $p = $p.handle();
-            ),*
+            )*
             let res = $crate::async_tx!($body).await;
             match res {
                 Err(TxError::Aborted) => {}

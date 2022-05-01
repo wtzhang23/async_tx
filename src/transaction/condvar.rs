@@ -84,6 +84,7 @@ macro_rules! wait {
                 waiter.add_handle(&mut $x).await;
             ),*
             waiter.await;
+            unreachable!();
         }
     };
 }

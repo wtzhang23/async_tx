@@ -32,3 +32,11 @@ impl Future for TxErrorPropagator {
         Poll::Pending
     }
 }
+
+#[macro_export]
+macro_rules! abort {
+    () => {{
+        use $crate::transaction::error::TxErrorPropagator;
+        TxErrorPropagator::new(TxError::Aborted).await;
+    }};
+}

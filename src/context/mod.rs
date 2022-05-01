@@ -34,6 +34,7 @@ pub(crate) unsafe trait TxPending: Send {
 pub(crate) struct TxContext {
     pending: Vec<Box<dyn TxPending>>,
     pending_forwards: Vec<Box<dyn TxPending>>,
+    priority: usize,
     stale_list: Vec<TxStaleFlag>,
     block_list: Vec<TxBlockMap>,
     error: Option<TxError>,
@@ -41,7 +42,7 @@ pub(crate) struct TxContext {
 }
 
 impl TxContext {
-    pub fn new() -> Self {
+    pub fn new(priority: usize) -> Self {
         Self {
             pending: Vec::new(),
             pending_forwards: Vec::new(),
@@ -49,6 +50,7 @@ impl TxContext {
             block_list: Vec::new(),
             error: None,
             deed: Arc::new(Deed::new()),
+            priority,
         }
     }
 
@@ -116,10 +118,14 @@ impl TxContext {
         self.deed.clone()
     }
 
+    pub fn priority(&self) -> usize {
+        self.priority
+    }
+
     pub fn unlock_all_locks(&mut self) {
         self.block_list.drain(..).for_each(|block_map| {
             if !block_map.stale() {
-                block_map.unlock(0);
+                block_map.unlock(self.priority);
             }
         });
     }

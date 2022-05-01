@@ -145,13 +145,14 @@ impl Deed {
 }
 
 impl Deed {
-    unsafe fn add_and_handle_cycle(self: &Arc::<Self>, successor: Arc<Self>) -> bool {
+    unsafe fn add_and_handle_cycle(self: &Arc<Self>, successor: Arc<Self>) -> bool {
         let self_raw = Arc::as_ptr(self);
         let successor_weak_ptr = Arc::downgrade(&successor).into_raw() as *mut Deed;
-        self.blocked.get().as_ref().unwrap().swap(
-            successor_weak_ptr,
-            Ordering::AcqRel,
-        );
+        self.blocked
+            .get()
+            .as_ref()
+            .unwrap()
+            .swap(successor_weak_ptr, Ordering::AcqRel);
 
         if Arc::as_ptr(&successor) == self_raw {
             return true;
@@ -159,20 +160,22 @@ impl Deed {
 
         let mut cur = successor;
         loop {
-            let next_ptr = cur.blocked.get().as_ref().unwrap().load(Ordering::Acquire) as *const Deed;
+            let next_ptr =
+                cur.blocked.get().as_ref().unwrap().load(Ordering::Acquire) as *const Deed;
             if next_ptr == std::ptr::null() {
                 return false;
             } else if next_ptr == self_raw {
                 self.remove_waiting_on();
                 return true;
-            } 
-            
+            }
+
             let weak = Weak::from_raw(next_ptr);
             let upgraded = weak.upgrade();
-            #[allow(unused_must_use)] {
+            #[allow(unused_must_use)]
+            {
                 weak.into_raw();
             }
-            
+
             if let Some(next) = upgraded {
                 cur = next;
             } else {
@@ -182,9 +185,14 @@ impl Deed {
     }
 
     unsafe fn remove_waiting_on(&self) {
-        let weak_ptr = self.blocked.get().as_ref().unwrap().swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let weak_ptr = self
+            .blocked
+            .get()
+            .as_ref()
+            .unwrap()
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
         if weak_ptr != std::ptr::null_mut() {
-            Weak::from_raw(weak_ptr);// acquire weak to drop reference count
+            Weak::from_raw(weak_ptr); // acquire weak to drop reference count
         }
     }
 }
@@ -230,14 +238,16 @@ impl TxBlockMapInner {
 
     fn try_lock(&mut self, lock_handle: TxLockHandle, priority: usize) -> TryLockStatus {
         if !self.locked() || self.highest_priority() < priority || self.stale {
-            self.priority_data.insert(priority, PriorityData::new(lock_handle.into_deed()));
+            self.priority_data
+                .insert(priority, PriorityData::new(lock_handle.into_deed()));
             TryLockStatus::Owned
         } else {
             if let Some(data) = self.priority_data.get(&priority) {
-                let has_cycle = unsafe { lock_handle.deed().add_and_handle_cycle(data.deed.clone()) };
+                let has_cycle =
+                    unsafe { lock_handle.deed().add_and_handle_cycle(data.deed.clone()) };
                 if has_cycle {
                     return TryLockStatus::Ignored;
-                } 
+                }
             }
 
             self.map
@@ -308,11 +318,7 @@ impl TxBlockMap {
         }
     }
 
-    fn try_lock(
-        &self,
-        lock_handle: TxLockHandle,
-        priority: usize,
-    ) -> TryLockStatus {
+    fn try_lock(&self, lock_handle: TxLockHandle, priority: usize) -> TryLockStatus {
         self.inner.lock().try_lock(lock_handle, priority)
     }
 }
@@ -416,20 +422,24 @@ impl Future for TxBlocker {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.tried {
             let flag = self.flag.clone();
-            let deed = CUR_CTX.with(|cur_ctx| cur_ctx.borrow().as_ref().unwrap().deed());
+            let (deed, priority) = CUR_CTX.with(|ctx| {
+                let ctx_ref = ctx.borrow();
+                let cur_ctx = ctx_ref.as_ref().unwrap();
+                (cur_ctx.deed(), cur_ctx.priority())
+            });
             let success = self
                 .block_map
-                .try_lock(TxLockHandle(flag, cx.waker().clone(), deed), 0);
+                .try_lock(TxLockHandle(flag, cx.waker().clone(), deed), priority);
             self.tried = true;
             match success {
                 TryLockStatus::Owned => {
                     self.add_block_map();
                     return Poll::Ready(());
-                },
-                TryLockStatus::Blocked => {},
+                }
+                TryLockStatus::Blocked => {}
                 TryLockStatus::Ignored => {
                     return Poll::Ready(());
-                },
+                }
             }
         }
 
