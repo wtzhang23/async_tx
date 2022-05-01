@@ -1,7 +1,7 @@
 use async_tx::data::containers::{TxBlockingContainer, TxDataContainer, TxNonblockingContainer};
 use async_tx::data::TxData;
+use async_tx::runtime::SingleFutureExecutor;
 use async_tx::{abort, async_tx, wait};
-use futures::executor::LocalPool;
 use std::{sync::Arc, thread::spawn};
 
 fn test_abba<C>(num_swap: usize, need_wait: bool)
@@ -16,8 +16,7 @@ where
         let a = a.clone();
         let b = b.clone();
         spawn(move || {
-            let mut local_pool = LocalPool::new();
-            local_pool.run_until(async move {
+            SingleFutureExecutor::new(async move {
                 for swap_idx in 0..num_swap {
                     async_tx!(
                         repeat | a,
@@ -46,14 +45,14 @@ where
                         swap_idx * 2
                     );
                 }
-            });
+            })
+            .execute();
         })
     };
     // spawn ba
     let ba = {
         spawn(move || {
-            let mut local_pool = LocalPool::new();
-            local_pool.run_until(async move {
+            SingleFutureExecutor::new(async move {
                 for swap_idx in 0..num_swap {
                     async_tx!(
                         repeat | b,
@@ -81,7 +80,8 @@ where
                         swap_idx * 2 + 1
                     );
                 }
-            });
+            })
+            .execute();
         })
     };
     ab.join().unwrap();
