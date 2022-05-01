@@ -46,6 +46,12 @@ impl TxDataWaiter {
     }
 }
 
+impl Default for TxDataWaiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Future for TxDataWaiter {
     type Output = (); // should never unblock
 

@@ -167,7 +167,7 @@ impl Deed {
                 .as_ref()
                 .unwrap_unchecked() // should not fail since cur.blocked guaranteed to not be null
                 .load(Ordering::Acquire) as *const Deed;
-            if next_ptr == std::ptr::null() {
+            if next_ptr.is_null() {
                 return false;
             } else if next_ptr == self_raw {
                 self.remove_waiting_on();
@@ -196,7 +196,7 @@ impl Deed {
             .as_ref()
             .unwrap_unchecked() // should not be null since self.blocked guaranteed to not be null
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if weak_ptr != std::ptr::null_mut() {
+        if !weak_ptr.is_null() {
             Weak::from_raw(weak_ptr); // acquire weak to drop reference count
         }
     }

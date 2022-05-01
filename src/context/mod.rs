@@ -26,6 +26,9 @@ pub(crate) enum TxPendingType {
     Drop,
 }
 
+/// # Safety
+///
+/// The lock and *_unlock functions must be paired together to avoid deadlock.
 pub(crate) unsafe trait TxPending: Send {
     unsafe fn lock(&self);
     fn committable(&self) -> bool;
@@ -158,6 +161,7 @@ impl Drop for TxContext {
     }
 }
 
+#[derive(Default)]
 pub struct CommitGuard {
     level: usize,
 }

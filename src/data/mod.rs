@@ -70,12 +70,14 @@ impl<T> ArcCow<T> {
                 }
                 flag
             };
-            if CUR_CTX.with(|ctx| {
+            let mut is_stale = false;
+            CUR_CTX.with(|ctx| {
                 let mut ctx_ref = ctx.borrow_mut();
                 let ctx = ctx_ref.as_mut().expect("upgrading to readable from an unresolved value must be done within a transaction context");
                 ctx.add_stale_flag(flag);
-                ctx.is_stale()
-            }) {
+                is_stale = ctx.is_stale()
+            });
+            if is_stale {
                 TxErrorPropagator::new(TxError::Aborted).await;
             }
         }
@@ -99,11 +101,7 @@ impl<T> ArcCow<T> {
     }
 
     fn write_pending(&self) -> bool {
-        if let ArcCow::Owned(_) = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, ArcCow::Owned(_))
     }
 
     fn pending_val(self) -> Option<T> {
@@ -162,7 +160,7 @@ where
     }
 
     fn version(&self) -> Option<usize> {
-        self.read_version.clone()
+        self.read_version
     }
 
     fn data(&self) -> &Arc<TxRwLock<C>> {
@@ -177,7 +175,7 @@ where
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
-            read_version: self.read_version.clone(),
+            read_version: self.read_version,
         }
     }
 }
@@ -289,18 +287,16 @@ where
     }
 
     fn lock_order(&self) -> usize {
-        Arc::as_ptr(&self.read_data.data()) as usize
+        Arc::as_ptr(self.read_data.data()) as usize
     }
 
     fn forwardable(&self) -> TxPendingType {
         let lvl = cur_lvl();
         let barrier = self.commit_level + 1;
-        if lvl == barrier {
-            TxPendingType::Commit
-        } else if lvl < barrier {
-            TxPendingType::Drop
-        } else {
-            TxPendingType::Forward
+        match lvl.cmp(&barrier) {
+            std::cmp::Ordering::Less => TxPendingType::Drop,
+            std::cmp::Ordering::Equal => TxPendingType::Commit,
+            std::cmp::Ordering::Greater => TxPendingType::Forward,
         }
     }
 }
