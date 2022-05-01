@@ -26,7 +26,7 @@ impl Future for TxErrorPropagator {
             cur_ctx
                 .borrow_mut()
                 .as_mut()
-                .unwrap()
+                .expect("TxErrorPropagator must be used within a AsyncTx context")
                 .signal_error(self.0.clone())
         });
         Poll::Pending

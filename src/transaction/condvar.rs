@@ -39,7 +39,10 @@ impl TxDataWaiter {
     }
 
     fn add_waiter<T: TxWaitable + 'static>(&mut self, waitable: T) {
-        self.waiters.as_mut().unwrap().push(Box::new(waitable));
+        self.waiters
+            .as_mut()
+            .expect("Cannot add waiter after already used as a future")
+            .push(Box::new(waitable));
     }
 }
 

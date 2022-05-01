@@ -74,15 +74,15 @@ where
         CUR_LVL.with(|cur_lvl| *cur_lvl.borrow_mut() -= 1);
 
         // restore old ctx
-        let mut ctx = CUR_CTX
-            .with(|cur_ctx| {
-                if let Some(last_ctx) = last_ctx {
-                    cur_ctx.borrow_mut().replace(last_ctx)
-                } else {
-                    cur_ctx.borrow_mut().take()
-                }
-            })
-            .unwrap(); // unwrap should not fail since cur_ctx was inserted previously
+        let ctx = CUR_CTX.with(|cur_ctx| {
+            if let Some(last_ctx) = last_ctx {
+                cur_ctx.borrow_mut().replace(last_ctx)
+            } else {
+                cur_ctx.borrow_mut().take()
+            }
+        });
+        debug_assert!(ctx.is_some());
+        let mut ctx = unsafe { ctx.unwrap_unchecked() }; // unwrap should not fail since cur_ctx was inserted previously
 
         match res {
             Poll::Pending => {

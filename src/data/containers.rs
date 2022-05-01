@@ -124,7 +124,8 @@ impl ConflictList {
     }
 
     pub fn wake_one(&mut self) -> Arc<Deed> {
-        self.blocked.pop_front().unwrap().acquire_lock()
+        debug_assert!(!self.blocked.is_empty());
+        unsafe { self.blocked.pop_front().unwrap_unchecked().acquire_lock() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -151,7 +152,7 @@ impl Deed {
         self.blocked
             .get()
             .as_ref()
-            .unwrap()
+            .unwrap_unchecked() // should not fail since self.blocked guaranteed to not be null
             .swap(successor_weak_ptr, Ordering::AcqRel);
 
         if Arc::as_ptr(&successor) == self_raw {
@@ -160,8 +161,12 @@ impl Deed {
 
         let mut cur = successor;
         loop {
-            let next_ptr =
-                cur.blocked.get().as_ref().unwrap().load(Ordering::Acquire) as *const Deed;
+            let next_ptr = cur
+                .blocked
+                .get()
+                .as_ref()
+                .unwrap_unchecked() // should not fail since cur.blocked guaranteed to not be null
+                .load(Ordering::Acquire) as *const Deed;
             if next_ptr == std::ptr::null() {
                 return false;
             } else if next_ptr == self_raw {
@@ -189,7 +194,7 @@ impl Deed {
             .blocked
             .get()
             .as_ref()
-            .unwrap()
+            .unwrap_unchecked() // should not be null since self.blocked guaranteed to not be null
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
         if weak_ptr != std::ptr::null_mut() {
             Weak::from_raw(weak_ptr); // acquire weak to drop reference count
@@ -264,7 +269,8 @@ impl TxBlockMapInner {
         }
 
         // check if any other transaction with the same priority own the lock
-        let priority_data = self.priority_data.remove(&priority).unwrap();
+        debug_assert!(self.priority_data.contains_key(&priority));
+        let priority_data = unsafe { self.priority_data.remove(&priority).unwrap_unchecked() }; // key guaranteed to exist since transaction unlocking must have inserted itself into the map when invoking lock
         unsafe { priority_data.deed.remove_waiting_on() };
         if !self.locked() {
             self.wake_one();
@@ -286,8 +292,7 @@ impl TxBlockMapInner {
     fn wake_one(&mut self) {
         if let Some(max_prio) = self.map.keys().rev().next().cloned() {
             debug_assert!(!self.stale);
-
-            let conflict_list = self.map.get_mut(&max_prio).unwrap();
+            let conflict_list = unsafe { self.map.get_mut(&max_prio).unwrap_unchecked() }; // key guaranteed to exist because was found through iterating through the map's keys
             let deed = conflict_list.wake_one();
             debug_assert!(!self.priority_data.contains_key(&max_prio));
             self.priority_data.insert(max_prio, PriorityData::new(deed));
@@ -334,7 +339,13 @@ impl TxBlockMap {
 
     pub(crate) fn stale(&self) -> bool {
         atomic::fence(Ordering::Acquire);
-        unsafe { self.inner.data_ptr().as_ref().unwrap().stale() }
+        unsafe {
+            self.inner
+                .data_ptr()
+                .as_ref()
+                .unwrap_unchecked() // value guaranteed to not be null since it was present in the mutex
+                .stale()
+        }
     }
 }
 
@@ -410,7 +421,7 @@ impl TxBlocker {
             cur_ctx
                 .borrow_mut()
                 .as_mut()
-                .unwrap()
+                .expect("TxBlocker must be used within an AsyncTx context")
                 .add_block_map(self.block_map.clone())
         });
     }
@@ -424,7 +435,9 @@ impl Future for TxBlocker {
             let flag = self.flag.clone();
             let (deed, priority) = CUR_CTX.with(|ctx| {
                 let ctx_ref = ctx.borrow();
-                let cur_ctx = ctx_ref.as_ref().unwrap();
+                let cur_ctx = ctx_ref
+                    .as_ref()
+                    .expect("TxBlocker must be used within an AsyncTx context");
                 (cur_ctx.deed(), cur_ctx.priority())
             });
             let success = self

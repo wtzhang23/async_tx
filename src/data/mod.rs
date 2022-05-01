@@ -2,7 +2,7 @@ pub mod containers;
 
 use crate::{
     context::flags::TxWaitFlag,
-    context::{cur_lvl, CommitGuard, TxPending, TxPendingType, CUR_CTX},
+    context::{cur_lvl, in_ctx, CommitGuard, TxPending, TxPendingType, CUR_CTX},
     transaction::condvar::TxWaitable,
     transaction::error::{TxError, TxErrorPropagator},
 };
@@ -72,7 +72,7 @@ impl<T> ArcCow<T> {
             };
             if CUR_CTX.with(|ctx| {
                 let mut ctx_ref = ctx.borrow_mut();
-                let ctx = ctx_ref.as_mut().unwrap();
+                let ctx = ctx_ref.as_mut().expect("upgrading to readable from an unresolved value must be done within a transaction context");
                 ctx.add_stale_flag(flag);
                 ctx.is_stale()
             }) {
@@ -220,7 +220,7 @@ where
     }
 
     fn set(&mut self, val: C::DataType) -> &mut C::DataType {
-        if CUR_CTX.with(|cur_ctx| cur_ctx.borrow().is_none()) {
+        if !in_ctx() {
             unimplemented!("Unsupported set outside of a Transaction context")
         }
 
@@ -234,7 +234,7 @@ where
     <C as TxDataContainer>::DataType: Clone,
 {
     async fn write(&mut self) -> &mut C::DataType {
-        if CUR_CTX.with(|cur_ctx| cur_ctx.borrow().is_none()) {
+        if !in_ctx() {
             unimplemented!("Unsupported write outside of a Transaction context")
         }
 
@@ -323,6 +323,16 @@ where
             inner: Some(TxDataHandleInner::new(data, commit_guard)),
         }
     }
+
+    fn inner(&self) -> &TxDataHandleInner<C> {
+        debug_assert!(self.inner.is_some());
+        unsafe { self.inner.as_ref().unwrap_unchecked() } // must not be none since value only taken when the handle is dropped
+    }
+
+    fn inner_mut(&mut self) -> &mut TxDataHandleInner<C> {
+        debug_assert!(self.inner.is_some());
+        unsafe { self.inner.as_mut().unwrap_unchecked() } // must not be none since value only taken when the handle is dropped
+    }
 }
 
 impl<C> TxDataHandle<C>
@@ -331,7 +341,7 @@ where
     <C as TxDataContainer>::DataType: Send + Sync,
 {
     pub(crate) fn wait_handle(&self) -> TxDataWaiter<C> {
-        TxDataWaiter::new(self.inner.as_ref().unwrap().read_data.clone())
+        TxDataWaiter::new(self.inner().read_data.clone())
     }
 }
 
@@ -341,15 +351,15 @@ where
     <C as TxDataContainer>::DataType: Send + Sync,
 {
     pub async fn read(&mut self) -> &C::DataType {
-        self.inner.as_mut().unwrap().read().await
+        self.inner_mut().read().await
     }
 
     pub async fn set(&mut self, val: C::DataType) -> &mut C::DataType {
-        self.inner.as_mut().unwrap().set(val)
+        self.inner_mut().set(val)
     }
 
     pub fn write_pending(&self) -> bool {
-        self.inner.as_ref().unwrap().local_data.write_pending()
+        self.inner().local_data.write_pending()
     }
 }
 
@@ -359,7 +369,7 @@ where
     <C as TxDataContainer>::DataType: Send + Sync + Clone,
 {
     pub async fn write(&mut self) -> &mut C::DataType {
-        self.inner.as_mut().unwrap().write().await
+        self.inner_mut().write().await
     }
 }
 
@@ -370,8 +380,12 @@ where
 {
     fn drop(&mut self) {
         CUR_CTX.with(|ctx| {
+            // drop can occur outside of AsyncTx context; i.e. the transaction be dropped before completion
             if let Some(cur_ctx) = ctx.borrow_mut().as_mut() {
-                cur_ctx.add_pending(Box::new(self.inner.take().unwrap()))
+                let inner = self.inner.take();
+                debug_assert!(inner.is_some());
+                cur_ctx.add_pending(Box::new(unsafe { inner.unwrap_unchecked() }))
+                // inner must not be None since it is only taken here; drop called at most once
             }
         })
     }
@@ -407,7 +421,7 @@ where
             unsafe {
                 let guard = Arc::as_ptr(self.read_data.data())
                     .as_ref()
-                    .unwrap()
+                    .unwrap_unchecked() // inner data not null since wrapped by Arc
                     .upgradable_read(); // arc owned by self guarantees that data won't be freed until end of function call
 
                 if guard.version() > version {

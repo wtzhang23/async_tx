@@ -16,6 +16,10 @@ pub(crate) fn cur_lvl() -> usize {
     CUR_LVL.with(|cur_lvl| *cur_lvl.borrow())
 }
 
+pub(crate) fn in_ctx() -> bool {
+    CUR_CTX.with(|cur_ctx| cur_ctx.borrow().is_some())
+}
+
 pub(crate) enum TxPendingType {
     Commit,
     Forward,
@@ -80,7 +84,8 @@ impl TxContext {
                 // forward all pending operations to parent context
                 self.pending_forwards.drain(..).for_each(|forward| {
                     let mut parent_ctx_opt = ctx.borrow_mut();
-                    let parent_ctx = parent_ctx_opt.as_mut().unwrap(); // there should be no forwards to context not wrapped in a transaction
+                    debug_assert!(parent_ctx_opt.is_some());
+                    let parent_ctx = unsafe { parent_ctx_opt.as_mut().unwrap_unchecked() }; // there should be no forwards to context not wrapped in a transaction
                     parent_ctx.add_pending(forward);
                 });
 
@@ -90,7 +95,8 @@ impl TxContext {
                     .filter(|flag| flag.forwardable())
                     .for_each(|flag| {
                         let mut parent_ctx_opt = ctx.borrow_mut();
-                        let parent_ctx = parent_ctx_opt.as_mut().unwrap(); // there should be no forwards to context not wrapped in a transaction
+                        debug_assert!(parent_ctx_opt.is_some());
+                        let parent_ctx = unsafe { parent_ctx_opt.as_mut().unwrap_unchecked() }; // there should be no forwards to context not wrapped in a transaction
                         parent_ctx.add_stale_flag(flag)
                     })
             });
