@@ -1,7 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::context::cur_lvl;
+
+// TODO: check if we can use nonatomic operations (i.e. RefCell) on these
 
 #[derive(Clone)]
 pub struct TxStaleFlag {
@@ -53,23 +55,44 @@ impl TxWaitFlag {
     }
 }
 
+pub(crate) enum LockStatus {
+    Unowned = 0,
+    Owned = 1,
+    Stale = 2,
+}
+
 #[derive(Clone)]
 pub struct TxLockFlag {
-    flag: Arc<AtomicBool>,
+    flag: Arc<AtomicUsize>,
 }
 
 impl TxLockFlag {
     pub(crate) fn new() -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
+            flag: Arc::new(AtomicUsize::new(LockStatus::Unowned as usize)),
         }
     }
 
-    pub(crate) fn give_ownership(&self) {
-        self.flag.store(true, Ordering::Release);
+    pub(crate) fn notify_ownership(&self) {
+        self.flag
+            .store(LockStatus::Owned as usize, Ordering::Relaxed);
     }
 
-    pub(crate) fn owned(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+    pub(crate) fn notify_stale(&self) {
+        self.flag
+            .store(LockStatus::Stale as usize, Ordering::Relaxed);
+    }
+
+    pub(crate) fn status(&self) -> LockStatus {
+        let status = self.flag.load(Ordering::Relaxed);
+        if status == LockStatus::Owned as usize {
+            LockStatus::Owned
+        } else if status == LockStatus::Unowned as usize {
+            LockStatus::Unowned
+        } else if status == LockStatus::Stale as usize {
+            LockStatus::Stale
+        } else {
+            unreachable!()
+        }
     }
 }

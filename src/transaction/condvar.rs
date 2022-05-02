@@ -1,3 +1,4 @@
+use crate::context::{in_ctx, signal_err};
 use crate::{
     context::flags::TxWaitFlag, context::CUR_CTX, data::containers::TxDataContainer,
     data::TxDataHandle, transaction::error::TxError,
@@ -72,12 +73,8 @@ impl Future for TxDataWaiter {
             });
         }
 
-        if self.wait_flag.awake() {
-            CUR_CTX.with(|ctx| {
-                if let Some(cur_ctx) = ctx.borrow_mut().as_mut() {
-                    cur_ctx.signal_error(TxError::Aborted);
-                }
-            });
+        if self.wait_flag.awake() && in_ctx() {
+            unsafe { signal_err(TxError::Aborted) }
         }
         Poll::Pending
     }

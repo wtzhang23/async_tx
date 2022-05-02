@@ -1,3 +1,6 @@
+use crate::context::flags::LockStatus;
+use crate::context::signal_err;
+use crate::TxError;
 use crate::{
     context::{
         flags::{TxLockFlag, TxStaleFlag},
@@ -7,7 +10,7 @@ use crate::{
 };
 use std::{
     cell::UnsafeCell,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     future::{Future, Ready},
     pin::Pin,
     sync::{
@@ -91,9 +94,15 @@ pub(crate) struct TxLockHandle(TxLockFlag, Waker, Arc<Deed>);
 impl TxLockHandle {
     fn acquire_lock(self) -> Arc<Deed> {
         let Self(flag, waker, deed) = self;
-        flag.give_ownership();
+        flag.notify_ownership();
         waker.wake();
         deed
+    }
+
+    fn notify_stale(self) {
+        let Self(flag, waker, _deed) = self;
+        flag.notify_stale();
+        waker.wake();
     }
 
     fn into_deed(self) -> Arc<Deed> {
@@ -110,25 +119,47 @@ impl TxLockHandle {
 #[derive(Default)]
 struct ConflictList {
     blocked: VecDeque<TxLockHandle>,
+    owning_deed: Option<Arc<Deed>>,
 }
 
 impl ConflictList {
-    pub fn wake_all_after_commit(&mut self) {
-        self.blocked.drain(..).for_each(|handle| {
-            handle.acquire_lock();
-        });
+    pub fn new(owning_deed: Arc<Deed>) -> Self {
+        Self {
+            blocked: VecDeque::new(),
+            owning_deed: Some(owning_deed),
+        }
+    }
+
+    pub fn unlock_all_after_commit(&mut self) {
+        self.blocked
+            .drain(..)
+            .for_each(|handle| handle.notify_stale());
     }
 
     pub fn add_handle(&mut self, handle: TxLockHandle) {
         self.blocked.push_back(handle);
     }
 
-    pub fn wake_one(&mut self) -> Arc<Deed> {
+    unsafe fn wake_one(&mut self) {
         debug_assert!(!self.blocked.is_empty());
-        unsafe { self.blocked.pop_front().unwrap_unchecked().acquire_lock() }
+        debug_assert!(self.owning_deed.is_none());
+        let to_wake = self.blocked.pop_front().unwrap_unchecked();
+        self.owning_deed = Some(to_wake.acquire_lock());
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub fn owning_deed(&mut self) -> Option<&Arc<Deed>> {
+        self.owning_deed.as_ref()
+    }
+
+    pub unsafe fn clear_deed(&mut self) {
+        debug_assert!(self.owning_deed.is_some());
+        self.owning_deed
+            .take()
+            .unwrap_unchecked()
+            .remove_waiting_on();
+    }
+
+    pub fn no_waiters(&self) -> bool {
         self.blocked.is_empty()
     }
 }
@@ -148,16 +179,16 @@ impl Deed {
 impl Deed {
     unsafe fn add_and_handle_cycle(self: &Arc<Self>, successor: Arc<Self>) -> bool {
         let self_raw = Arc::as_ptr(self);
+        if Arc::as_ptr(&successor) == self_raw {
+            return true;
+        }
+
         let successor_weak_ptr = Arc::downgrade(&successor).into_raw() as *mut Deed;
         self.blocked
             .get()
             .as_ref()
             .unwrap_unchecked() // should not fail since self.blocked guaranteed to not be null
             .swap(successor_weak_ptr, Ordering::AcqRel);
-
-        if Arc::as_ptr(&successor) == self_raw {
-            return true;
-        }
 
         let mut cur = successor;
         loop {
@@ -210,55 +241,45 @@ impl Drop for Deed {
 
 unsafe impl Sync for Deed {}
 
-struct PriorityData {
-    deed: Arc<Deed>,
-}
-
-impl PriorityData {
-    fn new(deed: Arc<Deed>) -> Self {
-        Self { deed }
-    }
-}
-
 enum TryLockStatus {
     Owned,
     Blocked,
     Ignored,
+    Stale,
 }
 
 struct TxBlockMapInner {
-    map: BTreeMap<usize, ConflictList>,
-    priority_data: HashMap<usize, PriorityData>,
+    priority_map: HashMap<usize, ConflictList>,
     stale: bool,
 }
 
 impl TxBlockMapInner {
     fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
-            priority_data: HashMap::new(),
+            priority_map: HashMap::new(),
             stale: false,
         }
     }
 
     fn try_lock(&mut self, lock_handle: TxLockHandle, priority: usize) -> TryLockStatus {
-        if !self.locked() || self.highest_priority() < priority || self.stale {
-            self.priority_data
-                .insert(priority, PriorityData::new(lock_handle.into_deed()));
+        if self.stale {
+            TryLockStatus::Stale
+        } else if !self.locked() || self.highest_priority() < priority {
+            let prev = self
+                .priority_map
+                .insert(priority, ConflictList::new(lock_handle.into_deed()));
+            debug_assert!(prev.is_none());
             TryLockStatus::Owned
         } else {
-            if let Some(data) = self.priority_data.get(&priority) {
+            let conflict_list = self.priority_map.entry(priority).or_default();
+            if let Some(owning_deed) = conflict_list.owning_deed() {
                 let has_cycle =
-                    unsafe { lock_handle.deed().add_and_handle_cycle(data.deed.clone()) };
+                    unsafe { lock_handle.deed().add_and_handle_cycle(owning_deed.clone()) };
                 if has_cycle {
                     return TryLockStatus::Ignored;
                 }
             }
-
-            self.map
-                .entry(priority)
-                .or_default()
-                .add_handle(lock_handle);
+            conflict_list.add_handle(lock_handle);
             TryLockStatus::Blocked
         }
     }
@@ -269,12 +290,32 @@ impl TxBlockMapInner {
         }
 
         // check if any other transaction with the same priority own the lock
-        debug_assert!(self.priority_data.contains_key(&priority));
-        let priority_data = unsafe { self.priority_data.remove(&priority).unwrap_unchecked() }; // key guaranteed to exist since transaction unlocking must have inserted itself into the map when invoking lock
-        unsafe { priority_data.deed.remove_waiting_on() };
-        if !self.locked() {
-            self.wake_one();
+        debug_assert!(self.priority_map.contains_key(&priority)); // key guaranteed to exist since transaction unlocking must have inserted itself into the map when invoking lock
+        let conflict_list = unsafe { self.priority_map.get_mut(&priority).unwrap_unchecked() };
+        unsafe { conflict_list.clear_deed() };
+
+        // remove to preserve invariant that the conflict with the maximum priority has waiters
+        if conflict_list.no_waiters() {
+            self.priority_map.remove(&priority);
         }
+
+        if !self.locked() {
+            let max_prio = self.highest_priority();
+            if let Some(conflict_list) = self.priority_map.get_mut(&max_prio) {
+                debug_assert!(!self.stale);
+                unsafe { conflict_list.wake_one() };
+            }
+        }
+    }
+
+    fn unlock_all_after_commit(&mut self) {
+        self.stale = true;
+        self.priority_map
+            .iter_mut()
+            .for_each(|(_prio, conflict_list)| {
+                conflict_list.unlock_all_after_commit();
+            });
+        atomic::fence(Ordering::Release);
     }
 
     fn stale(&self) -> bool {
@@ -282,33 +323,17 @@ impl TxBlockMapInner {
     }
 
     fn highest_priority(&self) -> usize {
-        self.priority_data.keys().cloned().max().unwrap_or(0)
+        self.priority_map.keys().cloned().max().unwrap_or(0)
     }
 
-    fn locked(&self) -> bool {
-        !self.priority_data.is_empty()
-    }
-
-    fn wake_one(&mut self) {
-        if let Some(max_prio) = self.map.keys().rev().next().cloned() {
-            debug_assert!(!self.stale);
-            let conflict_list = unsafe { self.map.get_mut(&max_prio).unwrap_unchecked() }; // key guaranteed to exist because was found through iterating through the map's keys
-            let deed = conflict_list.wake_one();
-            debug_assert!(!self.priority_data.contains_key(&max_prio));
-            self.priority_data.insert(max_prio, PriorityData::new(deed));
-            if conflict_list.is_empty() {
-                self.map.remove(&max_prio);
-            }
+    fn locked(&mut self) -> bool {
+        let highest_priority = self.highest_priority();
+        if let Some(conflict_list) = self.priority_map.get_mut(&highest_priority) {
+            let locked = conflict_list.owning_deed().is_some();
+            locked
+        } else {
+            false
         }
-    }
-
-    fn wake_all_after_commit(&mut self) {
-        self.stale = true;
-        self.map.iter_mut().for_each(|(_prio, conflict_list)| {
-            conflict_list.wake_all_after_commit();
-        });
-        self.priority_data.clear();
-        atomic::fence(Ordering::Release);
     }
 }
 
@@ -330,7 +355,7 @@ impl TxBlockMap {
 
 impl TxBlockMap {
     pub(crate) fn wake_all_after_commit(&self) {
-        self.inner.lock().wake_all_after_commit();
+        self.inner.lock().unlock_all_after_commit();
     }
 
     pub(crate) fn unlock(&self, priority: usize) {
@@ -453,14 +478,20 @@ impl Future for TxBlocker {
                 TryLockStatus::Ignored => {
                     return Poll::Ready(());
                 }
+                TryLockStatus::Stale => {
+                    unsafe { signal_err(TxError::Aborted) };
+                    return Poll::Pending;
+                }
             }
         }
 
-        if self.flag.owned() {
-            self.add_block_map();
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+        match self.flag.status() {
+            LockStatus::Unowned => Poll::Pending,
+            LockStatus::Owned => Poll::Ready(()),
+            LockStatus::Stale => {
+                unsafe { signal_err(TxError::Aborted) };
+                Poll::Pending
+            }
         }
     }
 }

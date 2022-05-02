@@ -12,4 +12,9 @@ parking_lot = "^0.12"
 
 [dev-dependencies]
 async-std = "^1.11"
+criterion = "^0.3"
 futures = "^0.3"
+
+[[bench]]
+name = "kv_store"
+harness = false
