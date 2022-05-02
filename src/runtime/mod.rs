@@ -306,101 +306,103 @@ where
         if condition(self) {
             return;
         }
-        if let Some(task) = self.ctx.dequeue_task() {
-            let mut next_task = task;
+
+        let mut wait_status = Some(WaitStatus::DequeueFailed);
+        let mut next_task;
+
+        // poll loop
+        loop {
+            // find next task
             loop {
-                let wake = Arc::new(TypedLocalExecutorWaker::new(&self.ctx));
-                let waker = wake.clone().into();
-                let mut cx = Context::from_waker(&waker);
-
-                let poll = {
-                    let pinned_future = unsafe {
-                        Pin::new_unchecked(next_task.as_ref().get().as_mut().unwrap_unchecked())
-                    }; // ptr cannot be null since next_task is not null
-                    pinned_future.poll(&mut cx)
-                };
-                {
-                    let cur_task = next_task;
-                    let mut wait_status = None;
-
-                    if matches!(poll, Poll::Ready(_)) {
-                        self.ctx.close_task();
+                debug_assert!(wait_status.is_some());
+                match unsafe { wait_status.unwrap_unchecked() } {
+                    WaitStatus::Ready => {
+                        return;
                     }
-
-                    let ready = condition(self);
-
-                    match poll {
-                        Poll::Ready(()) => {
+                    WaitStatus::DequeueSuccess(new_task) => {
+                        next_task = Some(new_task);
+                        break;
+                    }
+                    WaitStatus::DequeueFailed => {
+                        if let Some(new_task) = self.ctx.dequeue_task() {
+                            next_task = Some(new_task);
+                            break;
+                        } else {
+                            let ready = condition(self);
+                            let mut next_wait_status = None;
                             self.ctx.executor.invoke_then_wait(|| {
                                 let ws = self.wait_for_new_task(!ready);
                                 let need_to_block = ws.need_to_block();
-                                wait_status = Some(ws);
+                                next_wait_status = Some(ws);
                                 need_to_block
                             });
-                        }
-                        Poll::Pending => {
-                            self.ctx.executor.invoke_then_wait(|| {
-                                let ws = {
-                                    if !wake.woken() {
-                                        wake.register_future(cur_task);
-                                        self.wait_for_new_task(!ready)
-                                    } else {
-                                        self.enqueue_old_task(cur_task);
-                                        if ready {
-                                            WaitStatus::Ready
-                                        } else {
-                                            WaitStatus::DequeueSuccess(
-                                                self.ctx.dequeue_task().unwrap(),
-                                            )
-                                        }
-                                    }
-                                };
-                                let need_to_block = ws.need_to_block();
-                                wait_status = Some(ws);
-                                need_to_block
-                            });
-                        }
-                    };
-
-                    debug_assert_eq!(
-                        ready,
-                        matches!(wait_status.as_ref().unwrap(), WaitStatus::Ready)
-                    );
-                    loop {
-                        debug_assert!(wait_status.is_some());
-                        match unsafe { wait_status.unwrap_unchecked() } {
-                            WaitStatus::Ready => {
-                                return;
-                            }
-                            WaitStatus::DequeueSuccess(new_task) => {
-                                next_task = new_task;
-                                break;
-                            }
-                            WaitStatus::DequeueFailed => {
-                                if let Some(new_task) = self.ctx.dequeue_task() {
-                                    next_task = new_task;
-                                    break;
-                                } else {
-                                    let ready = condition(self);
-                                    let mut next_wait_status = None;
-                                    self.ctx.executor.invoke_then_wait(|| {
-                                        let ws = self.wait_for_new_task(!ready);
-                                        let need_to_block = ws.need_to_block();
-                                        next_wait_status = Some(ws);
-                                        need_to_block
-                                    });
-                                    debug_assert!(next_wait_status.is_some());
-                                    wait_status = next_wait_status;
-                                    debug_assert_eq!(
-                                        ready,
-                                        matches!(wait_status.as_ref().unwrap(), WaitStatus::Ready)
-                                    );
-                                }
-                            }
+                            debug_assert!(next_wait_status.is_some());
+                            wait_status = next_wait_status;
+                            debug_assert_eq!(
+                                ready,
+                                matches!(wait_status.as_ref().unwrap(), WaitStatus::Ready)
+                            );
                         }
                     }
                 }
             }
+
+            debug_assert!(next_task.is_some());
+            let next_task = unsafe { next_task.unwrap_unchecked() };
+            let wake = Arc::new(TypedLocalExecutorWaker::new(&self.ctx));
+            let waker = wake.clone().into();
+            let mut cx = Context::from_waker(&waker);
+
+            let poll = {
+                let pinned_future = unsafe {
+                    Pin::new_unchecked(next_task.as_ref().get().as_mut().unwrap_unchecked())
+                }; // ptr cannot be null since next_task is not null
+                pinned_future.poll(&mut cx)
+            };
+            let cur_task = next_task;
+            wait_status = None;
+
+            if matches!(poll, Poll::Ready(_)) {
+                self.ctx.close_task();
+            }
+
+            let ready = condition(self);
+
+            match poll {
+                Poll::Ready(()) => {
+                    self.ctx.executor.invoke_then_wait(|| {
+                        let ws = self.wait_for_new_task(!ready);
+                        let need_to_block = ws.need_to_block();
+                        wait_status = Some(ws);
+                        need_to_block
+                    });
+                }
+                Poll::Pending => {
+                    self.ctx.executor.invoke_then_wait(|| {
+                        let ws = {
+                            if !wake.woken() {
+                                wake.register_future(cur_task);
+                                self.wait_for_new_task(!ready)
+                            } else {
+                                self.enqueue_old_task(cur_task);
+                                if ready {
+                                    WaitStatus::Ready
+                                } else {
+                                    WaitStatus::DequeueSuccess(self.ctx.dequeue_task().unwrap())
+                                }
+                            }
+                        };
+                        let need_to_block = ws.need_to_block();
+                        wait_status = Some(ws);
+                        need_to_block
+                    });
+                }
+            };
+
+            debug_assert_eq!(
+                ready,
+                matches!(wait_status.as_ref().unwrap(), WaitStatus::Ready)
+            );
         }
     }
 }
@@ -477,15 +479,12 @@ impl GlobalLocalExecutor {
     }
 
     fn run_one(&mut self) {
-        let mut ran = 0;
+        let mut ran = false;
         self.typed.run_until_condition(|_exeutor| {
-            ran += 1;
-            ran == 2
+            let output = ran;
+            ran = true;
+            output
         });
-    }
-
-    fn run_all(&mut self) {
-        self.typed.run_until_condition(|current| current.idle());
     }
 
     fn context(&self) -> &Arc<TypedLocalExecutorContext<GlobalFuture>> {
@@ -634,7 +633,16 @@ impl GlobalExecutor {
                     local_executor.run_one();
                 }
 
-                local_executor.run_all();
+                while !inner.global_queue.is_empty()
+                    || !inner.local_queues.iter().all(|other| other.ctx.idle())
+                {
+                    if local_executor.context().idle() {
+                        inner.steal_one(local_executor.context());
+                    }
+                    // assert!(!local_executor.context().idle());
+                    local_executor.run_one();
+                }
+
                 inner.register_exit();
             });
         }

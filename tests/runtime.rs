@@ -339,7 +339,7 @@ mod global {
     #[test]
     fn test_fairness() {
         const NUM_ADD: usize = 100;
-        let executor = GlobalExecutor::new(1);
+        let executor = GlobalExecutor::new(4);
         for _ in 0..NUM_ADD {
             executor.enqueue(pending::<()>());
         }
@@ -361,12 +361,11 @@ mod global {
     }
 
     #[test]
-    fn test_run_all() {
+    fn test_join_all() {
         const NUM_ADD: usize = 100;
 
         let counter = Arc::new(Mutex::new([false; NUM_ADD]));
         let executor = GlobalExecutor::new(4);
-        executor.enqueue(pending::<()>());
         for idx in 0..NUM_ADD {
             let counter = counter.clone();
             executor.enqueue(async move {
