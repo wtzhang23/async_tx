@@ -76,7 +76,7 @@ mod future {
 mod local {
     use futures::select;
     use futures::FutureExt;
-    use parking_lot::{Condvar, Mutex};
+    use std::sync::{Condvar, Mutex};
 
     use std::future::{pending, ready};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -167,7 +167,7 @@ mod local {
                     let counter = counter.clone();
                     executor.enqueue(async move {
                         let (mutex, cv) = &*counter;
-                        let mut guard = mutex.lock();
+                        let mut guard = mutex.lock().unwrap();
                         guard[idx] = true;
                         if guard.iter().cloned().all(std::convert::identity) {
                             cv.notify_all();
@@ -180,9 +180,9 @@ mod local {
 
         {
             let (mutex, cv) = &*counter;
-            let mut guard = mutex.lock();
+            let mut guard = mutex.lock().unwrap();
             while !guard.iter().cloned().all(std::convert::identity) {
-                cv.wait(&mut guard);
+                guard = cv.wait(guard).unwrap();
             }
         }
     }
@@ -200,7 +200,7 @@ mod local {
                     let counter = counter.clone();
                     executor.enqueue(async move {
                         let (mutex, cv) = &*counter;
-                        let mut guard = mutex.lock();
+                        let mut guard = mutex.lock().unwrap();
                         guard[idx] = true;
                         if guard.iter().cloned().all(std::convert::identity) {
                             cv.notify_all();
@@ -213,9 +213,9 @@ mod local {
 
         {
             let (mutex, cv) = &*counter;
-            let mut guard = mutex.lock();
+            let mut guard = mutex.lock().unwrap();
             while !guard.iter().cloned().all(std::convert::identity) {
-                cv.wait(&mut guard);
+                guard = cv.wait(guard).unwrap();
             }
         }
     }
@@ -270,14 +270,14 @@ mod local {
         for idx in 0..NUM_ADD {
             let counter = counter.clone();
             executor.enqueue(async move {
-                let mut guard = counter.lock();
+                let mut guard = counter.lock().unwrap();
                 guard[idx] = true;
             });
         }
         executor.run_all();
 
         {
-            let guard = counter.lock();
+            let guard = counter.lock().unwrap();
             assert!(guard.iter().cloned().all(std::convert::identity));
         }
     }
@@ -288,7 +288,7 @@ mod global {
     use futures::channel::oneshot::channel;
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -358,5 +358,25 @@ mod global {
             rx.await.unwrap();
         });
         assert!(inner_ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_run_all() {
+        const NUM_ADD: usize = 100;
+
+        let counter = Arc::new(Mutex::new([false; NUM_ADD]));
+        let executor = GlobalExecutor::new(4);
+        executor.enqueue(pending::<()>());
+        for idx in 0..NUM_ADD {
+            let counter = counter.clone();
+            executor.enqueue(async move {
+                let mut guard = counter.lock().unwrap();
+                guard[idx] = true;
+            });
+        }
+        executor.join_all();
+
+        let guard = counter.lock().unwrap();
+        assert!(guard.iter().cloned().all(std::convert::identity));
     }
 }

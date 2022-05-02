@@ -484,6 +484,10 @@ impl GlobalLocalExecutor {
         });
     }
 
+    fn run_all(&mut self) {
+        self.typed.run_until_condition(|current| current.idle());
+    }
+
     fn context(&self) -> &Arc<TypedLocalExecutorContext<GlobalFuture>> {
         self.typed.context()
     }
@@ -510,6 +514,9 @@ impl GlobalExecutorStealer {
 struct GlobalExecutorInner {
     global_queue: Injector<PinnedTask<GlobalFuture>>,
     local_queues: Vec<GlobalExecutorStealer>,
+    exit_signaled: AtomicBool,
+    lock: Mutex<usize>,
+    cv: Condvar,
 }
 
 impl GlobalExecutorInner {
@@ -519,6 +526,9 @@ impl GlobalExecutorInner {
         Self {
             global_queue,
             local_queues,
+            exit_signaled: AtomicBool::new(false),
+            lock: Mutex::new(num_threads),
+            cv: Condvar::new(),
         }
     }
 
@@ -572,6 +582,22 @@ impl GlobalExecutorInner {
             }
         }
     }
+
+    fn block_until_all_exited(&self) {
+        let mut guard = self.lock.lock();
+        while *guard != 0 {
+            self.cv.wait(&mut guard);
+        }
+    }
+
+    fn register_exit(&self) {
+        let mut guard = self.lock.lock();
+        debug_assert!(*guard > 0);
+        *guard -= 1;
+        if *guard == 0 {
+            self.cv.notify_all();
+        }
+    }
 }
 
 unsafe impl Send for GlobalExecutorInner {}
@@ -594,9 +620,9 @@ impl GlobalExecutor {
         }
         let inner = Arc::new(inner);
         for (_thread_idx, mut local_executor) in local_queues.into_iter().enumerate() {
-            let inner = Arc::downgrade(&inner);
+            let inner = inner.clone();
             std::thread::spawn(move || {
-                while let Some(inner) = inner.upgrade() {
+                while !inner.exit_signaled.load(Ordering::Relaxed) {
                     if local_executor.context().idle() {
                         local_executor.context().executor.invoke_then_wait(|| {
                             inner.steal_one(local_executor.context());
@@ -607,6 +633,9 @@ impl GlobalExecutor {
                     }
                     local_executor.run_one();
                 }
+
+                local_executor.run_all();
+                inner.register_exit();
             });
         }
 
@@ -619,5 +648,13 @@ impl GlobalExecutor {
     {
         self.inner
             .enqueue_new_task(Arc::pin(UnsafeCell::new(future)));
+    }
+
+    pub fn join_all(self) {
+        self.inner.exit_signaled.store(true, Ordering::Relaxed);
+        self.inner.local_queues.iter().for_each(|stealer| {
+            stealer.wake();
+        });
+        self.inner.block_until_all_exited();
     }
 }
