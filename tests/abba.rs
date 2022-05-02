@@ -1,6 +1,6 @@
 use async_tx::data::containers::{TxBlockingContainer, TxDataContainer, TxNonblockingContainer};
 use async_tx::data::TxData;
-use async_tx::runtime::SingleFutureExecutor;
+use async_tx::runtime::block_on;
 use async_tx::{abort, async_tx, wait};
 use std::{sync::Arc, thread::spawn};
 
@@ -16,7 +16,7 @@ where
         let a = a.clone();
         let b = b.clone();
         spawn(move || {
-            SingleFutureExecutor::new(async move {
+            block_on(async move {
                 for swap_idx in 0..num_swap {
                     async_tx!(
                         repeat | a,
@@ -45,14 +45,13 @@ where
                         swap_idx * 2
                     );
                 }
-            })
-            .execute();
+            });
         })
     };
     // spawn ba
     let ba = {
         spawn(move || {
-            SingleFutureExecutor::new(async move {
+            block_on(async move {
                 for swap_idx in 0..num_swap {
                     async_tx!(
                         repeat | b,
@@ -80,8 +79,7 @@ where
                         swap_idx * 2 + 1
                     );
                 }
-            })
-            .execute();
+            });
         })
     };
     ab.join().unwrap();

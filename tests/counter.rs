@@ -1,7 +1,7 @@
 use async_tx::async_tx;
 use async_tx::data::containers::{TxBlockingContainer, TxDataContainer, TxNonblockingContainer};
 use async_tx::data::TxData;
-use async_tx::runtime::SingleFutureExecutor;
+use async_tx::runtime::block_on;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{sync::Arc, thread::spawn};
 
@@ -16,7 +16,7 @@ where
         let counter = counter.clone();
         let alive_ctr = alive_ctr.clone();
         let guard = spawn(move || {
-            SingleFutureExecutor::new(async move {
+            block_on(async move {
                 for add_num in 0..num_add {
                     async_tx!(
                         repeat | counter | {
@@ -28,8 +28,7 @@ where
                     .unwrap();
                     println!("Thread {thread_idx} finished for addition {add_num}");
                 }
-            })
-            .execute();
+            });
             alive_ctr.fetch_sub(1, Ordering::Relaxed);
         });
         guards.push(guard);
@@ -37,14 +36,13 @@ where
 
     // contester that polls on value
     while alive_ctr.load(Ordering::Relaxed) > 0 {
-        let val = SingleFutureExecutor::new(async_tx!(
+        let val = block_on(async_tx!(
             repeat | counter | {
                 let val = *counter.read().await;
                 assert!(!counter.write_pending());
                 val
             }
         ))
-        .execute()
         .unwrap();
         println!("Main thread read {val}");
     }
@@ -53,9 +51,7 @@ where
         guard.join().unwrap();
     }
 
-    let executor =
-        SingleFutureExecutor::new(async_tx!(repeat | counter | { *counter.read().await }));
-    let val = executor.execute().unwrap();
+    let val = block_on(async_tx!(repeat | counter | { *counter.read().await })).unwrap();
     assert_eq!(val, num_threads * num_add);
 }
 

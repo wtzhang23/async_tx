@@ -1,6 +1,6 @@
 use async_tx::data::containers::{TxBlockingContainer, TxDataContainer, TxNonblockingContainer};
 use async_tx::data::TxData;
-use async_tx::runtime::SingleFutureExecutor;
+use async_tx::runtime::block_on;
 use async_tx::{async_tx, wait};
 use std::{sync::Arc, thread::spawn};
 
@@ -13,7 +13,7 @@ where
     let producer_guard = {
         let queue = queue.clone();
         spawn(move || {
-            SingleFutureExecutor::new(async move {
+            block_on(async move {
                 for to_enqueue in 0..num_enqueue {
                     async_tx!(
                         repeat | queue | {
@@ -27,14 +27,13 @@ where
                     .unwrap();
                     println!("Producer finished for enqueue number {to_enqueue}");
                 }
-            })
-            .execute();
+            });
         })
     };
     // spawn consumer
     let consumer_guard = {
         spawn(move || {
-            SingleFutureExecutor::new(async move {
+            block_on(async move {
                 for to_dequeue in 0..num_enqueue {
                     let dequeued = async_tx!(
                         repeat | queue | {
@@ -51,8 +50,7 @@ where
                     assert_eq!(dequeued, to_dequeue);
                     println!("Consumer finished for dequeue number {to_dequeue}");
                 }
-            })
-            .execute();
+            });
         })
     };
     producer_guard.join().unwrap();
