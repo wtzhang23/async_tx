@@ -91,7 +91,6 @@ mod local {
 
         // no pending tasks
         {
-            assert_eq!(executor.num_enqueued(), 0);
             let val = executor.run_until(async { 42 });
             assert_eq!(val, 42);
         }
@@ -105,7 +104,6 @@ mod local {
                     inner_ran.store(true, Ordering::Relaxed);
                 });
             }
-            assert_eq!(executor.num_enqueued(), 1);
             let val = executor.run_until(async { 42 });
             assert_eq!(val, 42);
             executor.run_all();
@@ -114,7 +112,6 @@ mod local {
 
         // all tasks
         {
-            assert_eq!(executor.num_enqueued(), 0);
             let inner_write = Arc::new(AtomicUsize::new(0));
             {
                 let inner_write = inner_write.clone();
@@ -122,7 +119,6 @@ mod local {
                     inner_write.store(42, Ordering::Relaxed);
                 });
             }
-            assert_eq!(executor.num_enqueued(), 1);
             executor.run_all();
             assert_eq!(inner_write.load(Ordering::Relaxed), 42);
         }
@@ -284,5 +280,83 @@ mod local {
             let guard = counter.lock();
             assert!(guard.iter().cloned().all(std::convert::identity));
         }
+    }
+}
+
+mod global {
+    use async_tx::runtime::{block_on, GlobalExecutor};
+    use futures::channel::oneshot::channel;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn test_trivial() {
+        let executor = GlobalExecutor::new(1);
+
+        let inner_ran = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        {
+            let inner_ran = inner_ran.clone();
+            executor.enqueue(async move {
+                inner_ran.store(true, Ordering::Relaxed);
+                tx.send(()).unwrap();
+            });
+        }
+
+        block_on(async move {
+            rx.await.unwrap();
+        });
+        assert!(inner_ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_long_sleep() {
+        let executor = GlobalExecutor::new(1);
+
+        let inner_ran = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        {
+            let inner_ran = inner_ran.clone();
+            executor.enqueue(async move {
+                async_std::task::sleep(Duration::from_millis(100)).await;
+                async_std::task::sleep(Duration::from_millis(100)).await;
+                async_std::task::sleep(Duration::from_millis(100)).await;
+                async_std::task::sleep(Duration::from_millis(100)).await;
+                async_std::task::sleep(Duration::from_millis(100)).await;
+                inner_ran.store(true, Ordering::Relaxed);
+                tx.send(()).unwrap();
+            });
+        }
+
+        block_on(async move {
+            rx.await.unwrap();
+        });
+        assert!(inner_ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_fairness() {
+        const NUM_ADD: usize = 100;
+        let executor = GlobalExecutor::new(1);
+        for _ in 0..NUM_ADD {
+            executor.enqueue(pending::<()>());
+        }
+
+        let inner_ran = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        {
+            let inner_ran = inner_ran.clone();
+            executor.enqueue(async move {
+                inner_ran.store(true, Ordering::Relaxed);
+                tx.send(()).unwrap();
+            });
+        }
+
+        block_on(async move {
+            rx.await.unwrap();
+        });
+        assert!(inner_ran.load(Ordering::Relaxed));
     }
 }
