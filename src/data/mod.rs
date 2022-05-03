@@ -17,7 +17,10 @@ type TxRwLock<T> = RwLock<parking_lot::RawRwLock, T>;
 pub type TxNonblockingData<T> = TxData<TxNonblockingContainer<T>>;
 pub type TxBlockingData<T> = TxData<TxBlockingContainer<T>>;
 
-pub struct TxData<C> {
+pub struct TxData<C>
+where
+    C: TxDataContainer,
+{
     most_recent: Arc<TxRwLock<C>>,
 }
 
@@ -62,11 +65,21 @@ impl<T> ArcCow<T> {
 
                 if C::needs_access() {
                     // gaining access must be done after acquiring arc as lock must be dropped after awaiting
-                    {
+                    let block_map = {
                         let guard = guard;
                         guard.gain_access()
                     }
                     .await;
+
+                    if let Some(block_map) = block_map {
+                        CUR_CTX.with(|cur_ctx| {
+                            cur_ctx
+                                .borrow_mut()
+                                .as_mut()
+                                .expect("upgrading to readable from an unresolved value must be done within a transaction context")
+                                .add_block_map(block_map)
+                        });
+                    }
                 }
                 flag
             };

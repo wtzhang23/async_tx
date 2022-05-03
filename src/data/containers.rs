@@ -22,7 +22,7 @@ use std::{
 
 pub trait TxDataContainer {
     type DataType;
-    type AccessFuture: Future<Output = ()>;
+    type AccessFuture: Future<Output = Option<TxBlockMap>>;
     fn new(data: Self::DataType) -> Self;
     fn commit(&mut self, new_data: Self::DataType);
     fn add_waiter<W: TxWaitable + Send + Sync + 'static>(&mut self, waiter: W);
@@ -41,7 +41,7 @@ pub struct TxNonblockingContainer<T> {
 
 impl<T> TxDataContainer for TxNonblockingContainer<T> {
     type DataType = T;
-    type AccessFuture = Ready<()>;
+    type AccessFuture = Ready<Option<TxBlockMap>>;
     fn new(data: Self::DataType) -> Self {
         Self {
             data: Arc::new(data),
@@ -75,7 +75,7 @@ impl<T> TxDataContainer for TxNonblockingContainer<T> {
     }
 
     fn gain_access(&self) -> Self::AccessFuture {
-        std::future::ready(())
+        std::future::ready(None)
     }
 
     fn get_data(&self) -> (Arc<Self::DataType>, TxStaleFlag) {
@@ -309,6 +309,7 @@ impl TxBlockMapInner {
     }
 
     fn unlock_all_after_commit(&mut self) {
+        debug_assert!(!self.stale);
         self.stale = true;
         self.priority_map
             .iter_mut()
@@ -337,7 +338,7 @@ impl TxBlockMapInner {
     }
 }
 
-pub(crate) struct TxBlockMap {
+pub struct TxBlockMap {
     inner: Arc<TxBlockingContainerLock<TxBlockMapInner>>,
 }
 
@@ -440,20 +441,10 @@ impl TxBlocker {
             flag,
         }
     }
-
-    fn add_block_map(&self) {
-        CUR_CTX.with(|cur_ctx| {
-            cur_ctx
-                .borrow_mut()
-                .as_mut()
-                .expect("TxBlocker must be used within an AsyncTx context")
-                .add_block_map(self.block_map.clone())
-        });
-    }
 }
 
 impl Future for TxBlocker {
-    type Output = ();
+    type Output = Option<TxBlockMap>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.tried {
@@ -471,12 +462,11 @@ impl Future for TxBlocker {
             self.tried = true;
             match success {
                 TryLockStatus::Owned => {
-                    self.add_block_map();
-                    return Poll::Ready(());
+                    return Poll::Ready(Some(self.block_map.clone()));
                 }
                 TryLockStatus::Blocked => {}
                 TryLockStatus::Ignored => {
-                    return Poll::Ready(());
+                    return Poll::Ready(None);
                 }
                 TryLockStatus::Stale => {
                     unsafe { signal_err(TxError::Aborted) };
@@ -487,7 +477,7 @@ impl Future for TxBlocker {
 
         match self.flag.status() {
             LockStatus::Unowned => Poll::Pending,
-            LockStatus::Owned => Poll::Ready(()),
+            LockStatus::Owned => Poll::Ready(Some(self.block_map.clone())),
             LockStatus::Stale => {
                 unsafe { signal_err(TxError::Aborted) };
                 Poll::Pending
