@@ -20,7 +20,7 @@ where
                             if queue.read().await.is_some() {
                                 wait!(queue);
                             }
-                            queue.set(Some(to_enqueue)).await;
+                            queue.set(Some(to_enqueue));
                         }
                     )
                     .await
@@ -41,7 +41,7 @@ where
                                 wait!(queue);
                             }
                             let val = queue.read().await.clone();
-                            queue.set(None).await;
+                            queue.set(None);
                             val.unwrap()
                         }
                     )

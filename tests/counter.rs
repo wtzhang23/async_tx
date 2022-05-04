@@ -21,7 +21,7 @@ where
                     async_tx!(
                         repeat | counter | {
                             let prev = *counter.read().await;
-                            counter.set(prev + 1).await;
+                            counter.set(prev + 1);
                         }
                     )
                     .await

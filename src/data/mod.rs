@@ -26,8 +26,7 @@ where
 
 impl<C> TxData<C>
 where
-    C: TxDataContainer + Send + Sync,
-    <C as TxDataContainer>::DataType: Send + Sync,
+    C: TxDataContainer,
 {
     pub fn new(data: C::DataType) -> Self {
         Self {
@@ -36,11 +35,22 @@ where
     }
 
     pub fn handle(&self) -> TxDataHandle<C> {
-        self.handle_for_guard(&CommitGuard::new())
+        self.handle_for_guard(CommitGuard::new())
     }
 
-    pub fn handle_for_guard(&self, commit_guard: &CommitGuard) -> TxDataHandle<C> {
+    pub fn handle_for_guard(&self, commit_guard: CommitGuard) -> TxDataHandle<C> {
         TxDataHandle::new(self.most_recent.clone(), commit_guard)
+    }
+}
+
+impl<C> Clone for TxData<C>
+where
+    C: TxDataContainer,
+{
+    fn clone(&self) -> Self {
+        Self {
+            most_recent: self.most_recent.clone(),
+        }
     }
 }
 
@@ -262,8 +272,7 @@ where
 
 unsafe impl<C> TxPending for TxDataHandleInner<C>
 where
-    C: TxDataContainer + Sync + Send + 'static,
-    <C as TxDataContainer>::DataType: Sync + Send,
+    C: TxDataContainer + 'static,
 {
     unsafe fn lock(&self) {
         if self.local_data.write_pending() {
@@ -316,20 +325,20 @@ where
 
 pub struct TxDataHandle<C>
 where
-    C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync,
+    C: TxDataContainer + 'static,
 {
     inner: Option<TxDataHandleInner<C>>,
+    commit_guard: CommitGuard,
 }
 
 impl<C> TxDataHandle<C>
 where
-    C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync,
+    C: TxDataContainer + 'static,
 {
-    fn new(data: Arc<TxRwLock<C>>, commit_guard: &CommitGuard) -> Self {
+    fn new(data: Arc<TxRwLock<C>>, commit_guard: CommitGuard) -> Self {
         Self {
-            inner: Some(TxDataHandleInner::new(data, commit_guard)),
+            inner: Some(TxDataHandleInner::new(data, &commit_guard)),
+            commit_guard,
         }
     }
 
@@ -346,46 +355,47 @@ where
 
 impl<C> TxDataHandle<C>
 where
-    C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync,
-{
-    pub(crate) fn wait_handle(&self) -> TxDataWaiter<C> {
-        TxDataWaiter::new(self.inner().read_data.clone())
-    }
-}
-
-impl<C> TxDataHandle<C>
-where
-    C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync,
+    C: TxDataContainer + 'static,
 {
     pub async fn read(&mut self) -> &C::DataType {
         self.inner_mut().read().await
     }
 
-    pub async fn set(&mut self, val: C::DataType) -> &mut C::DataType {
+    pub fn set(&mut self, val: C::DataType) -> &mut C::DataType {
         self.inner_mut().set(val)
     }
 
     pub fn write_pending(&self) -> bool {
         self.inner().local_data.write_pending()
     }
+
+    pub fn commit_guard(&self) -> CommitGuard {
+        self.commit_guard
+    }
 }
 
 impl<C> TxDataHandle<C>
 where
-    C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync + Clone,
+    C: TxDataContainer + 'static,
+    <C as TxDataContainer>::DataType: Clone,
 {
     pub async fn write(&mut self) -> &mut C::DataType {
         self.inner_mut().write().await
     }
 }
 
-impl<C> Drop for TxDataHandle<C>
+impl<C> TxDataHandle<C>
 where
     C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync,
+{
+    pub(crate) fn wait_handle(&self) -> TxDataWaiter<C> {
+        TxDataWaiter::new(self.inner().read_data.clone())
+    }
+}
+
+impl<C> Drop for TxDataHandle<C>
+where
+    C: TxDataContainer + 'static,
 {
     fn drop(&mut self) {
         CUR_CTX.with(|ctx| {
@@ -402,7 +412,7 @@ where
 
 pub(crate) struct TxDataWaiter<C>
 where
-    C: TxDataContainer + 'static,
+    C: TxDataContainer + Send + Sync + 'static,
 {
     read_data: TxReadData<C>,
     waker_and_flag: Option<(Waker, TxWaitFlag)>,
@@ -410,7 +420,7 @@ where
 
 impl<C> TxDataWaiter<C>
 where
-    C: TxDataContainer + 'static,
+    C: TxDataContainer + Send + Sync + 'static,
 {
     pub fn new(read_data: TxReadData<C>) -> Self {
         Self {
@@ -423,7 +433,6 @@ where
 impl<C> TxWaitable for TxDataWaiter<C>
 where
     C: TxDataContainer + Send + Sync + 'static,
-    <C as TxDataContainer>::DataType: Send + Sync,
 {
     fn enqueue_wait(mut self: Box<Self>, waker: Waker, flag: TxWaitFlag) {
         if let Some(version) = self.read_data.version() {

@@ -1,5 +1,6 @@
 pub mod context;
 pub mod data;
+pub mod log;
 pub mod runtime;
 pub mod transaction;
 
