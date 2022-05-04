@@ -397,14 +397,16 @@ where
     C: TxDataContainer + 'static,
 {
     fn drop(&mut self) {
-        CUR_CTX.with(|ctx| {
-            // drop can occur outside of AsyncTx context; i.e. the transaction be dropped before completion
-            if let Some(cur_ctx) = ctx.borrow_mut().as_mut() {
-                if let Some(inner) = self.inner.take() {
-                    cur_ctx.add_pending(Box::new(inner))
+        CUR_CTX
+            .try_with(|ctx| {
+                // drop can occur outside of AsyncTx context; i.e. the transaction be dropped before completion
+                if let Some(cur_ctx) = ctx.borrow_mut().as_mut() {
+                    if let Some(inner) = self.inner.take() {
+                        cur_ctx.add_pending(Box::new(inner))
+                    }
                 }
-            }
-        })
+            })
+            .ok();
     }
 }
 

@@ -70,7 +70,7 @@ where
 
         // enter future body
         CUR_LVL.with(|cur_lvl| *cur_lvl.borrow_mut() += 1);
-        let res = self.as_mut().future().poll(future_ctx);
+        let res = self.as_mut().future().poll(future_ctx); // TODO: panicing will lead to obscure backtrace; need to catch panics
         CUR_LVL.with(|cur_lvl| *cur_lvl.borrow_mut() -= 1);
 
         // restore old ctx

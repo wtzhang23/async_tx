@@ -430,7 +430,7 @@ where
             }
         });
 
-        debug_assert!(cur_num_added > cur_num_removed);
+        debug_assert!(cur_num_added >= cur_num_removed);
         cur_num_added - cur_num_removed
     }
 

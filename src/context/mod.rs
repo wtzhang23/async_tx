@@ -27,7 +27,7 @@ pub(crate) unsafe fn signal_err(error: TxError) {
     debug_assert!(in_ctx());
     CUR_CTX.with(|cur_ctx| {
         cur_ctx.borrow_mut().as_mut().unwrap().signal_error(error);
-    })
+    });
 }
 
 pub(crate) enum TxPendingType {
@@ -167,6 +167,7 @@ impl TxContext {
 
 impl Drop for TxContext {
     fn drop(&mut self) {
+        // only perform cleanup operations if it's safe to do so
         self.unlock_all_locks();
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_std::task::block_on;
 
 use crate::async_tx;
+use crate::context::in_ctx;
 use crate::log::collections::KeyValueCollection;
 
 use super::TxNonblockingLogHashMap;
@@ -121,4 +122,5 @@ fn test_batch_insert_remove() {
             assert_eq!(num_keys_iter, 0);
         }
     });
+    assert!(!in_ctx());
 }
