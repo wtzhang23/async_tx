@@ -34,8 +34,8 @@ where
                             let a_val = a_val.clone().unwrap();
 
                             assert_eq!(a_val, swap_idx * 2);
-                            b.set(Some(a_val + 1));
-                            a.set(None);
+                            b.set(Some(a_val + 1)).await;
+                            a.set(None).await;
                         }
                     )
                     .await
@@ -68,8 +68,8 @@ where
                             let b_val = b_val.clone().unwrap();
                             assert_eq!(b_val, swap_idx * 2 + 1);
                             a.read().await; // trigger lock for a
-                            a.set(Some(b_val + 1));
-                            b.set(None);
+                            a.set(Some(b_val + 1)).await;
+                            b.set(None).await;
                         }
                     )
                     .await

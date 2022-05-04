@@ -17,6 +17,7 @@ type TxRwLock<T> = RwLock<parking_lot::RawRwLock, T>;
 pub type TxNonblockingData<T> = TxData<TxNonblockingContainer<T>>;
 pub type TxBlockingData<T> = TxData<TxBlockingContainer<T>>;
 
+#[derive(Debug)]
 pub struct TxData<C>
 where
     C: TxDataContainer,
@@ -127,8 +128,9 @@ impl<T> ArcCow<T> {
         matches!(self, ArcCow::Owned(_))
     }
 
-    fn pending_val(self) -> Option<T> {
-        if let ArcCow::Owned(val) = self {
+    fn pending_val(&mut self) -> Option<T> {
+        let local = std::mem::replace(self, Self::Unresolved);
+        if let ArcCow::Owned(val) = local {
             Some(val)
         } else {
             None
@@ -226,10 +228,6 @@ where
     }
 
     async fn read(&mut self) -> &C::DataType {
-        if CUR_CTX.with(|cur_ctx| cur_ctx.borrow().is_none()) {
-            unimplemented!("Unsupported read outside of a Transaction context")
-        }
-
         let (reference, version) = self
             .local_data
             .upgrade_readable(&*self.read_data.data())
@@ -240,11 +238,7 @@ where
         reference
     }
 
-    fn set(&mut self, val: C::DataType) -> &mut C::DataType {
-        if !in_ctx() {
-            unimplemented!("Unsupported set outside of a Transaction context")
-        }
-
+    pub(crate) fn set(&mut self, val: C::DataType) -> &mut C::DataType {
         self.local_data.override_to_writable(val)
     }
 }
@@ -255,10 +249,6 @@ where
     <C as TxDataContainer>::DataType: Clone,
 {
     async fn write(&mut self) -> &mut C::DataType {
-        if !in_ctx() {
-            unimplemented!("Unsupported write outside of a Transaction context")
-        }
-
         let (reference, version) = self
             .local_data
             .upgrade_writable(&*self.read_data.data())
@@ -292,14 +282,14 @@ where
         }
     }
 
-    unsafe fn abort_and_unlock(self: Box<Self>) {
+    unsafe fn abort_and_unlock(&mut self) {
         if self.local_data.write_pending() {
             debug_assert!(self.read_data.data().raw().is_locked());
             self.read_data.data().raw().unlock_exclusive()
         }
     }
 
-    unsafe fn commit_and_unlock(self: Box<Self>) {
+    unsafe fn commit_and_unlock(&mut self) {
         if let Some(new_data) = self.local_data.pending_val() {
             debug_assert!(self.read_data.data().raw().is_locked());
             let mut_inner = self.read_data.data().data_ptr().as_mut().unwrap_unchecked(); // internal lock's value must not be null
@@ -335,33 +325,17 @@ impl<C> TxDataHandle<C>
 where
     C: TxDataContainer + 'static,
 {
-    fn new(data: Arc<TxRwLock<C>>, commit_guard: CommitGuard) -> Self {
-        Self {
-            inner: Some(TxDataHandleInner::new(data, &commit_guard)),
-            commit_guard,
-        }
-    }
-
-    fn inner(&self) -> &TxDataHandleInner<C> {
-        debug_assert!(self.inner.is_some());
-        unsafe { self.inner.as_ref().unwrap_unchecked() } // must not be none since value only taken when the handle is dropped
-    }
-
-    fn inner_mut(&mut self) -> &mut TxDataHandleInner<C> {
-        debug_assert!(self.inner.is_some());
-        unsafe { self.inner.as_mut().unwrap_unchecked() } // must not be none since value only taken when the handle is dropped
-    }
-}
-
-impl<C> TxDataHandle<C>
-where
-    C: TxDataContainer + 'static,
-{
     pub async fn read(&mut self) -> &C::DataType {
+        if !in_ctx() {
+            unimplemented!("Unsupported read outside of a Transaction context")
+        }
         self.inner_mut().read().await
     }
 
-    pub fn set(&mut self, val: C::DataType) -> &mut C::DataType {
+    pub async fn set(&mut self, val: C::DataType) -> &mut C::DataType {
+        if !in_ctx() {
+            unimplemented!("Unsupported set outside of a Transaction context")
+        }
         self.inner_mut().set(val)
     }
 
@@ -372,6 +346,28 @@ where
     pub fn commit_guard(&self) -> CommitGuard {
         self.commit_guard
     }
+
+    pub(crate) fn take_inner(&mut self) -> TxDataHandleInner<C> {
+        debug_assert!(self.inner.is_some());
+        unsafe { self.inner.take().unwrap_unchecked() }
+    }
+
+    fn new(data: Arc<TxRwLock<C>>, commit_guard: CommitGuard) -> Self {
+        Self {
+            inner: Some(TxDataHandleInner::new(data, &commit_guard)),
+            commit_guard,
+        }
+    }
+
+    pub(crate) fn inner(&self) -> &TxDataHandleInner<C> {
+        debug_assert!(self.inner.is_some());
+        unsafe { self.inner.as_ref().unwrap_unchecked() } // must not be none since value only taken when the handle is dropped
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut TxDataHandleInner<C> {
+        debug_assert!(self.inner.is_some());
+        unsafe { self.inner.as_mut().unwrap_unchecked() } // must not be none since value only taken when the handle is dropped
+    }
 }
 
 impl<C> TxDataHandle<C>
@@ -380,6 +376,9 @@ where
     <C as TxDataContainer>::DataType: Clone,
 {
     pub async fn write(&mut self) -> &mut C::DataType {
+        if !in_ctx() {
+            unimplemented!("Unsupported write outside of a Transaction context")
+        }
         self.inner_mut().write().await
     }
 }
@@ -401,10 +400,9 @@ where
         CUR_CTX.with(|ctx| {
             // drop can occur outside of AsyncTx context; i.e. the transaction be dropped before completion
             if let Some(cur_ctx) = ctx.borrow_mut().as_mut() {
-                let inner = self.inner.take();
-                debug_assert!(inner.is_some());
-                cur_ctx.add_pending(Box::new(unsafe { inner.unwrap_unchecked() }))
-                // inner must not be None since it is only taken here; drop called at most once
+                if let Some(inner) = self.inner.take() {
+                    cur_ctx.add_pending(Box::new(inner))
+                }
             }
         })
     }

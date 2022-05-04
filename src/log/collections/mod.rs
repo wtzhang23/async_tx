@@ -1,14 +1,26 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::{TxLogEntry, TxLogView};
+use crate::data::containers::{TxBlockingContainer, TxNonblockingContainer};
+use crate::CommitGuard;
+
+use super::{TxLogEntry, TxLogHead, TxLogStructure, TxLogStructureHandle, TxLogView};
 
 pub trait KeyValueCollection<K, V>: Default {
+    fn with_capacity(size: usize) -> Self;
+    fn reserve(&mut self, additional: usize);
+    fn shrink_to_fit(&mut self);
+
     fn insert(&mut self, key: K, val: V) -> Option<V>;
     fn remove(&mut self, key: &K) -> Option<V>;
-    fn get(&self, key: &K) -> Option<&V>;
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Eq + ?Sized,
+        K: Borrow<Q>;
     fn get_mut(&mut self, key: &K) -> Option<&mut V>;
     fn len(&self) -> usize;
     fn iter_key_values<F: FnMut(&K, &V)>(&self, iter_fn: F);
@@ -17,17 +29,21 @@ pub trait KeyValueCollection<K, V>: Default {
         self.len() == 0
     }
 
-    fn contains(&self, key: &K) -> bool {
+    fn contains<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Eq + ?Sized,
+        K: Borrow<Q>,
+    {
         self.get(key).is_some()
     }
 }
 
-pub enum KeyValueRecord<K, V, C>
+pub enum KeyValueRecord<K, V, Collection>
 where
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>>,
 {
     Segment {
-        collection: C,
+        collection: Collection,
         num_added: usize,
         num_removed: usize,
         _phantom_key: PhantomData<K>,
@@ -35,28 +51,49 @@ where
     },
 }
 
-struct KeyValueView<K, V, C>
+impl<K, V, Collection> Debug for KeyValueRecord<K, V, Collection>
 where
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>> + Debug,
 {
-    local_collection: C,
-    prev: Option<Arc<TxLogEntry<KeyValueRecord<K, V, C>>>>,
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Segment {
+                collection,
+                num_added,
+                num_removed,
+                _phantom_key,
+                _phantom_val,
+            } => f
+                .debug_struct("Segment")
+                .field("collection", collection)
+                .field("num_added", num_added)
+                .field("num_removed", num_removed)
+                .finish(),
+        }
+    }
+}
+
+pub struct KeyValueView<K, V, Collection>
+where
+    Collection: KeyValueCollection<K, Option<V>>,
+{
+    local_collection: Collection,
+    prev: Option<Arc<TxLogEntry<KeyValueRecord<K, V, Collection>>>>,
     num_added: usize,
     num_removed: usize,
 }
 
-impl<K, V, C> KeyValueView<K, V, C>
+impl<K, V, Collection> KeyValueView<K, V, Collection>
 where
     K: Clone + Eq + Hash,
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>>,
 {
-    fn apply_on_prevs<'a, F>(&'a self, mut apply: F)
+    fn apply_on_prevs<'a, F>(&'a self, apply: F)
     where
-        F: FnMut(&'a Arc<TxLogEntry<KeyValueRecord<K, V, C>>>) -> bool,
+        F: FnMut(&'a Arc<TxLogEntry<KeyValueRecord<K, V, Collection>>>) -> bool,
     {
         if let Some(prev) = &self.prev {
-            apply(prev);
-            prev.apply_on_prevs(apply);
+            prev.apply_on_list(apply);
         }
     }
 
@@ -71,15 +108,24 @@ where
             }
         }
     }
+
+    pub fn log_size(&self) -> usize {
+        let mut size = 0;
+        self.apply_on_prevs(|_entry| {
+            size += 1;
+            true
+        });
+        size
+    }
 }
 
-impl<K, V, C> TxLogView for KeyValueView<K, V, C>
+impl<K, V, Collection> TxLogView for KeyValueView<K, V, Collection>
 where
     K: Clone + Hash + Eq,
     V: Clone,
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>>,
 {
-    type Record = KeyValueRecord<K, V, C>;
+    type Record = KeyValueRecord<K, V, Collection>;
 
     fn consume_prev(&mut self, entry: &Arc<TxLogEntry<Self::Record>>) -> bool {
         self.prev = Some(entry.clone());
@@ -101,18 +147,42 @@ fn normalize_add_remove(added: usize, removed: usize) -> (usize, usize) {
 }
 
 #[allow(clippy::from_over_into)]
-impl<K, V, C> Into<TxLogEntry<KeyValueRecord<K, V, C>>> for KeyValueView<K, V, C>
+impl<K, V, Collection> Into<TxLogEntry<KeyValueRecord<K, V, Collection>>>
+    for KeyValueView<K, V, Collection>
 where
-    K: Clone,
+    K: Hash + Eq + Clone,
     V: Clone,
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>>,
 {
-    fn into(self) -> TxLogEntry<KeyValueRecord<K, V, C>> {
+    fn into(self) -> TxLogEntry<KeyValueRecord<K, V, Collection>> {
         let mut local_collection = self.local_collection;
         let mut total_num_added = self.num_added;
         let mut total_num_removed = self.num_removed;
         let mut new_prev = None;
         if let Some(prev) = self.prev {
+            let mut num_iter = 0;
+            let mut expected_additional_capacity = 0;
+
+            prev.apply_on_list(|prev| match prev.record() {
+                KeyValueRecord::Segment {
+                    collection,
+                    num_added: _num_added,
+                    num_removed: _num_removed,
+                    _phantom_key,
+                    _phantom_val,
+                } => {
+                    if collection.len()
+                        >= (local_collection.len() + expected_additional_capacity) * 2
+                    {
+                        return false;
+                    }
+                    num_iter += 1;
+                    expected_additional_capacity += collection.len();
+                    true
+                }
+            });
+            local_collection.reserve(expected_additional_capacity);
+
             prev.apply_on_list(|prev| {
                 match prev.record() {
                     KeyValueRecord::Segment {
@@ -122,13 +192,16 @@ where
                         _phantom_key,
                         _phantom_val,
                     } => {
-                        if collection.len() < local_collection.len() * 2 {
-                            new_prev = Some(prev.clone());
+                        if num_iter == 0 || collection.len() >= local_collection.len() * 2 {
+                            new_prev = Some(<Arc<_> as Clone>::clone(prev));
                             return false;
                         }
+                        num_iter -= 1;
 
                         collection.iter_key_values(|key, val| {
-                            if !local_collection.contains(key) {
+                            if let Some(None) = local_collection.get(key) {
+                                local_collection.remove(key);
+                            } else {
                                 local_collection.insert(key.clone(), val.clone());
                             }
                         });
@@ -141,10 +214,23 @@ where
                         total_num_removed = cur_removed + prev_removed;
                     }
                 }
-
                 true
             });
         }
+
+        if new_prev.is_none() {
+            let mut new_collection = Collection::with_capacity(local_collection.len());
+            local_collection.iter_key_values(|key, value| {
+                if value.is_some() {
+                    new_collection.insert(key.clone(), value.clone());
+                }
+            });
+            local_collection = new_collection;
+        }
+        local_collection.shrink_to_fit();
+
+        let (total_num_added, total_num_removed) =
+            normalize_add_remove(total_num_added, total_num_removed);
 
         TxLogEntry::new(
             KeyValueRecord::Segment {
@@ -159,13 +245,13 @@ where
     }
 }
 
-impl<K, V, C> Default for KeyValueView<K, V, C>
+impl<K, V, Collection> Default for KeyValueView<K, V, Collection>
 where
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>>,
 {
     fn default() -> Self {
         Self {
-            local_collection: C::default(),
+            local_collection: Collection::default(),
             prev: None,
             num_added: 0,
             num_removed: 0,
@@ -173,11 +259,11 @@ where
     }
 }
 
-impl<K, V, C> KeyValueCollection<K, V> for KeyValueView<K, V, C>
+impl<K, V, Collection> KeyValueCollection<K, V> for KeyValueView<K, V, Collection>
 where
     K: Hash + Eq + Clone,
     V: Clone,
-    C: KeyValueCollection<K, Option<V>>,
+    Collection: KeyValueCollection<K, Option<V>>,
 {
     fn insert(&mut self, key: K, val: V) -> Option<V> {
         if let Some(old) = self.local_collection.remove(&key) {
@@ -262,7 +348,11 @@ where
         }
     }
 
-    fn get(&self, key: &K) -> Option<&V> {
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Eq + ?Sized,
+        K: Borrow<Q>,
+    {
         if let Some(val) = self.local_collection.get(key) {
             val.as_ref()
         } else {
@@ -279,7 +369,7 @@ where
                         rv = val.as_ref();
                         false
                     } else {
-                        false
+                        true
                     }
                 }
             });
@@ -322,6 +412,7 @@ where
     fn len(&self) -> usize {
         let mut cur_num_added = self.num_added;
         let mut cur_num_removed = self.num_removed;
+        let mut visited = 0;
         self.apply_on_prevs(|prev| match prev.record() {
             KeyValueRecord::Segment {
                 collection: _collection,
@@ -334,6 +425,7 @@ where
                     normalize_add_remove(cur_num_added + num_added, cur_num_removed + num_removed);
                 cur_num_added = new_num_added;
                 cur_num_removed = new_num_removed;
+                visited += 1;
                 true
             }
         });
@@ -365,9 +457,22 @@ where
             }
         });
     }
+
+    fn with_capacity(_size: usize) -> Self {
+        Self::default() // not supported
+    }
+
+    fn reserve(&mut self, _size: usize) {
+        // noop; not supported
+    }
+
+    fn shrink_to_fit(&mut self) {
+        // noop; not supported
+    }
 }
 
-struct TxHashMap<K, V> {
+#[derive(Debug)]
+pub struct TxHashMap<K, V> {
     inner: HashMap<K, V>,
 }
 
@@ -383,7 +488,11 @@ where
         self.inner.remove(key)
     }
 
-    fn get(&self, key: &K) -> Option<&V> {
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Eq + ?Sized,
+        K: Borrow<Q>,
+    {
         self.inner.get(key)
     }
 
@@ -398,6 +507,20 @@ where
     fn iter_key_values<F: FnMut(&K, &V)>(&self, mut iter_fn: F) {
         self.inner.iter().for_each(|(key, val)| iter_fn(key, val))
     }
+
+    fn with_capacity(size: usize) -> Self {
+        Self {
+            inner: HashMap::with_capacity(size),
+        }
+    }
+
+    fn reserve(&mut self, size: usize) {
+        self.inner.reserve(size);
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit();
+    }
 }
 
 impl<K, V> Default for TxHashMap<K, V> {
@@ -407,3 +530,95 @@ impl<K, V> Default for TxHashMap<K, V> {
         }
     }
 }
+
+type TxLogHmRecord<K, V> = KeyValueRecord<K, V, TxHashMap<K, Option<V>>>;
+type TxLogHmHead<K, V> = TxLogHead<TxLogHmRecord<K, V>>;
+type TxLogHmView<K, V> = KeyValueView<K, V, TxHashMap<K, Option<V>>>;
+type TxNbLogHmContainer<K, V> = TxNonblockingContainer<TxLogHmHead<K, V>>;
+type TxNbLogHmHandle<K, V> =
+    TxLogStructureHandle<TxLogHmRecord<K, V>, TxNbLogHmContainer<K, V>, TxLogHmView<K, V>>;
+
+#[derive(Debug)]
+pub struct TxNonblockingLogHashMap<K, V>
+where
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
+{
+    log_structure: TxLogStructure<TxLogHmRecord<K, V>, TxNbLogHmContainer<K, V>>,
+}
+
+impl<K, V> TxNonblockingLogHashMap<K, V>
+where
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
+{
+    pub fn new() -> Self {
+        Self {
+            log_structure: TxLogStructure::new(),
+        }
+    }
+
+    pub fn handle(&self) -> TxNbLogHmHandle<K, V> {
+        self.log_structure.handle()
+    }
+
+    pub fn handle_for_guard(&self, commit_guard: CommitGuard) -> TxNbLogHmHandle<K, V> {
+        self.log_structure.handle_for_guard(commit_guard)
+    }
+}
+
+impl<K, V> Default for TxNonblockingLogHashMap<K, V>
+where
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+type TxBLogHmContainer<K, V> = TxBlockingContainer<TxLogHmHead<K, V>>;
+type TxBLogHmHandle<K, V> =
+    TxLogStructureHandle<TxLogHmRecord<K, V>, TxBLogHmContainer<K, V>, TxLogHmView<K, V>>;
+
+#[derive(Debug)]
+pub struct TxBlockingLogHashMap<K, V>
+where
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
+{
+    log_structure: TxLogStructure<TxLogHmRecord<K, V>, TxBLogHmContainer<K, V>>,
+}
+
+impl<K, V> TxBlockingLogHashMap<K, V>
+where
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
+{
+    pub fn new() -> Self {
+        Self {
+            log_structure: TxLogStructure::new(),
+        }
+    }
+
+    pub fn handle(&self) -> TxBLogHmHandle<K, V> {
+        self.log_structure.handle()
+    }
+
+    pub fn handle_for_guard(&self, commit_guard: CommitGuard) -> TxBLogHmHandle<K, V> {
+        self.log_structure.handle_for_guard(commit_guard)
+    }
+}
+
+impl<K, V> Default for TxBlockingLogHashMap<K, V>
+where
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests;

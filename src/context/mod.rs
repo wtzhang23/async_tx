@@ -42,8 +42,8 @@ pub(crate) enum TxPendingType {
 pub(crate) unsafe trait TxPending {
     unsafe fn lock(&self);
     fn committable(&self) -> bool;
-    unsafe fn abort_and_unlock(self: Box<Self>);
-    unsafe fn commit_and_unlock(self: Box<Self>);
+    unsafe fn abort_and_unlock(&mut self);
+    unsafe fn commit_and_unlock(&mut self);
     fn lock_order(&self) -> usize;
     fn forwardable(&self) -> TxPendingType;
 }
@@ -84,12 +84,12 @@ impl TxContext {
         if committable {
             self.pending
                 .drain(..)
-                .for_each(|pend| unsafe { pend.commit_and_unlock() });
+                .for_each(|mut pend| unsafe { pend.commit_and_unlock() });
         } else {
             self.pending
                 .drain(..)
                 .into_iter()
-                .for_each(|pend| unsafe { pend.abort_and_unlock() });
+                .for_each(|mut pend| unsafe { pend.abort_and_unlock() });
         }
 
         if committable {

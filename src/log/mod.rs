@@ -2,11 +2,12 @@ pub mod collections;
 
 use std::sync::Arc;
 
+use crate::context::{TxPending, CUR_CTX};
 use crate::data::containers::TxDataContainer;
 use crate::data::{TxData, TxDataHandle};
 use crate::CommitGuard;
 
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct TxLogHead<Record> {
     top: Option<Arc<TxLogEntry<Record>>>,
 }
@@ -18,13 +19,12 @@ impl<Record> TxLogHead<Record> {
         }
     }
 
-    fn apply_on_log<F>(&self, mut apply: F)
+    fn apply_on_log<F>(&self, apply: F)
     where
         F: FnMut(&Arc<TxLogEntry<Record>>) -> bool,
     {
         if let Some(top) = &self.top {
-            apply(top);
-            top.apply_on_prevs(apply);
+            top.apply_on_list(apply);
         }
     }
 }
@@ -35,7 +35,15 @@ impl<Record> Default for TxLogHead<Record> {
     }
 }
 
-#[derive(Clone)]
+impl<Record> Clone for TxLogHead<Record> {
+    fn clone(&self) -> Self {
+        Self {
+            top: self.top.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TxLogEntry<Record> {
     record: Record,
     prev: Option<Arc<TxLogEntry<Record>>>,
@@ -62,11 +70,12 @@ impl<Record> TxLogEntry<Record> {
     {
         if let Some(prev) = &self.prev {
             if apply(prev) {
-                let cur = prev;
+                let mut cur = prev;
                 while let Some(prev) = &cur.prev {
-                    if apply(prev) {
+                    if !apply(prev) {
                         break;
                     }
+                    cur = prev;
                 }
             }
         }
@@ -76,8 +85,9 @@ impl<Record> TxLogEntry<Record> {
     where
         F: FnMut(&'a Arc<Self>) -> bool,
     {
-        apply(self);
-        self.apply_on_prevs(apply);
+        if apply(self) {
+            self.apply_on_prevs(apply);
+        }
     }
 }
 
@@ -86,6 +96,7 @@ pub trait TxLogView: Default + Into<TxLogEntry<Self::Record>> {
     fn consume_prev(&mut self, entry: &Arc<TxLogEntry<Self::Record>>) -> bool;
 }
 
+#[derive(Debug)]
 pub struct TxLogStructure<Record, C>
 where
     C: TxDataContainer<DataType = TxLogHead<Record>>,
@@ -135,7 +146,7 @@ where
     Write(View),
 }
 
-pub struct TxLogStructureHandle<Record, C, View>
+struct TxLogStructureHandleInner<Record, C, View>
 where
     C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
     View: TxLogView<Record = Record>,
@@ -144,7 +155,7 @@ where
     view_status: ViewStatus<View>,
 }
 
-impl<Record, C, View> TxLogStructureHandle<Record, C, View>
+impl<Record, C, View> TxLogStructureHandleInner<Record, C, View>
 where
     C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
     View: TxLogView<Record = Record>,
@@ -165,15 +176,14 @@ where
     }
 }
 
-impl<Record, C, View> TxLogStructureHandle<Record, C, View>
+impl<Record, C, View> TxLogStructureHandleInner<Record, C, View>
 where
     C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
     View: TxLogView<Record = Record>,
-    Record: Clone,
 {
     pub async fn write(&mut self) -> &mut View {
         self.read().await;
-        self.log_handle.write().await;
+        self.log_handle.write().await; // signal that log_handle has writes pending
         if matches!(&self.view_status, ViewStatus::Read(_)) {
             let prev = std::mem::replace(&mut self.view_status, ViewStatus::Unresolved);
             if let ViewStatus::Read(view) = prev {
@@ -190,20 +200,7 @@ where
     }
 }
 
-impl<Record, C, View> Drop for TxLogStructureHandle<Record, C, View>
-where
-    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
-    View: TxLogView<Record = Record>,
-{
-    fn drop(&mut self) {
-        let status = std::mem::replace(&mut self.view_status, ViewStatus::Unresolved);
-        if let ViewStatus::Write(view) = status {
-            self.log_handle.set(TxLogHead::new(view.into()));
-        }
-    }
-}
-
-impl<Record, C, View> From<TxDataHandle<C>> for TxLogStructureHandle<Record, C, View>
+impl<Record, C, View> From<TxDataHandle<C>> for TxLogStructureHandleInner<Record, C, View>
 where
     C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
     View: TxLogView<Record = Record>,
@@ -212,6 +209,108 @@ where
         Self {
             log_handle: val,
             view_status: ViewStatus::Unresolved,
+        }
+    }
+}
+
+unsafe impl<Record, C, View> TxPending for TxLogStructureHandleInner<Record, C, View>
+where
+    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
+    View: TxLogView<Record = Record>,
+{
+    unsafe fn lock(&self) {
+        self.log_handle.inner().lock();
+    }
+
+    fn committable(&self) -> bool {
+        self.log_handle.inner().committable()
+    }
+
+    unsafe fn abort_and_unlock(&mut self) {
+        let mut inner = self.log_handle.take_inner();
+        inner.abort_and_unlock();
+    }
+
+    unsafe fn commit_and_unlock(&mut self) {
+        // propagate writes
+        let status = std::mem::replace(&mut self.view_status, ViewStatus::Unresolved);
+        if let ViewStatus::Write(view) = status {
+            self.log_handle.inner_mut().set(TxLogHead::new(view.into()));
+        }
+        let mut inner = self.log_handle.take_inner();
+        inner.commit_and_unlock();
+    }
+
+    fn lock_order(&self) -> usize {
+        self.log_handle.inner().lock_order()
+    }
+
+    fn forwardable(&self) -> crate::context::TxPendingType {
+        self.log_handle.inner().forwardable()
+    }
+}
+
+pub struct TxLogStructureHandle<Record, C, View>
+where
+    Record: 'static,
+    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
+    View: TxLogView<Record = Record> + 'static,
+{
+    inner: Option<TxLogStructureHandleInner<Record, C, View>>,
+}
+
+impl<Record, C, View> TxLogStructureHandle<Record, C, View>
+where
+    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
+    View: TxLogView<Record = Record>,
+{
+    fn inner_mut(&mut self) -> &mut TxLogStructureHandleInner<Record, C, View> {
+        debug_assert!(self.inner.is_some());
+        unsafe { self.inner.as_mut().unwrap_unchecked() }
+    }
+
+    pub async fn read(&mut self) -> &View {
+        self.inner_mut().read().await
+    }
+}
+
+impl<Record, C, View> TxLogStructureHandle<Record, C, View>
+where
+    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
+    View: TxLogView<Record = Record>,
+{
+    pub async fn write(&mut self) -> &mut View {
+        self.inner_mut().write().await
+    }
+}
+
+impl<Record, C, View> Drop for TxLogStructureHandle<Record, C, View>
+where
+    Record: 'static,
+    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
+    View: TxLogView<Record = Record> + 'static,
+{
+    fn drop(&mut self) {
+        CUR_CTX.with(|ctx| {
+            // drop can occur outside of AsyncTx context; i.e. the transaction be dropped before completion
+            if let Some(cur_ctx) = ctx.borrow_mut().as_mut() {
+                if let Some(inner) = self.inner.take() {
+                    cur_ctx.add_pending(Box::new(inner))
+                }
+            }
+        })
+    }
+}
+
+impl<Record, C, View> From<TxDataHandle<C>> for TxLogStructureHandle<Record, C, View>
+where
+    Record: 'static,
+    C: TxDataContainer<DataType = TxLogHead<Record>> + 'static,
+    View: TxLogView<Record = Record> + 'static,
+{
+    fn from(val: TxDataHandle<C>) -> Self {
+        Self {
+            inner: Some(TxLogStructureHandleInner::from(val)),
         }
     }
 }

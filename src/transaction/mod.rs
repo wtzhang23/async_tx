@@ -111,13 +111,20 @@ macro_rules! async_tx {
         use $crate::AsyncTx;
         AsyncTx::new(async move { $body })
     }};
-    (repeat |$($p:ident),*| $body: block) => {async {
-        use $crate::{AsyncTx, TxError};
-        let mut output;
+    (repeat |$($data:ident),*$(; $($copy:ident),*)?| $body: block) => {async {
+        use $crate::TxError;
+        let output;
         loop {
             $(
-                let mut $p = $p.handle();
+                let mut $data = $data.handle();
             )*
+
+            $(
+                $(
+                    #[allow(unused_mut)]
+                    let mut $copy = $copy.clone();
+                )*
+            )?
             let res = $crate::async_tx!($body).await;
             match res {
                 Err(TxError::Aborted) => {}

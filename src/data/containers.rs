@@ -11,6 +11,7 @@ use crate::{
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
+    fmt::Debug,
     future::{Future, Ready},
     pin::Pin,
     sync::{
@@ -87,8 +88,23 @@ impl<T> TxDataContainer for TxNonblockingContainer<T> {
     }
 }
 
+impl<T> Debug for TxNonblockingContainer<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxNonblockingContainer")
+            .field("data", &self.data)
+            .field("version", &self.version)
+            .field("stale_flag", &self.stale_flag)
+            .field("waiters", &"<opaque>")
+            .finish()
+    }
+}
+
 type TxBlockingContainerLock<T> = parking_lot::Mutex<T>;
 
+#[derive(Debug)]
 pub(crate) struct TxLockHandle(TxLockFlag, Waker, Arc<Deed>);
 
 impl TxLockHandle {
@@ -116,7 +132,7 @@ impl TxLockHandle {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ConflictList {
     blocked: VecDeque<TxLockHandle>,
     owning_deed: Option<Arc<Deed>>,
@@ -164,6 +180,7 @@ impl ConflictList {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Deed {
     blocked: UnsafeCell<AtomicPtr<Deed>>, // TODO: check if atomic ptr can be removed; need memory fence to flush write buffers
 }
@@ -248,6 +265,7 @@ enum TryLockStatus {
     Stale,
 }
 
+#[derive(Debug)]
 struct TxBlockMapInner {
     priority_map: HashMap<usize, ConflictList>,
     stale: bool,
@@ -338,6 +356,7 @@ impl TxBlockMapInner {
     }
 }
 
+#[derive(Debug)]
 pub struct TxBlockMap {
     inner: Arc<TxBlockingContainerLock<TxBlockMapInner>>,
 }
@@ -423,6 +442,18 @@ impl<T> TxDataContainer for TxBlockingContainer<T> {
 
     fn version(&self) -> usize {
         self.nonblocking.version()
+    }
+}
+
+impl<T> Debug for TxBlockingContainer<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxBlockingContainer")
+            .field("nonblocking", &self.nonblocking)
+            .field("block_map", &self.block_map)
+            .finish()
     }
 }
 

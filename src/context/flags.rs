@@ -5,7 +5,7 @@ use crate::context::cur_lvl;
 
 // TODO: check if we can use nonatomic operations (i.e. RefCell) on these
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TxStaleFlag {
     flag: Arc<AtomicBool>,
     lvl: usize,
@@ -34,7 +34,7 @@ impl TxStaleFlag {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TxWaitFlag {
     flag: Arc<AtomicBool>,
 }
@@ -61,7 +61,7 @@ pub(crate) enum LockStatus {
     Stale = 2,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TxLockFlag {
     flag: Arc<AtomicUsize>,
 }
