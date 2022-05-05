@@ -1,12 +1,17 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use futures::executor::block_on;
 use parking_lot::{Condvar, Mutex};
+use rand::prelude::SliceRandom;
+use rand::{Rng, SeedableRng};
 
+use crate::data::TxDataHandle;
 use crate::{async_tx, wait, CommitGuard, TxNonblockingData};
 
 const BUFFER_SIZE: usize = 32;
-const NUM_ENQUEUE_DEQUEUE: usize = 2 * 3 * 10 * 14 * 16;
+const NUM_TX: usize = 2 * 3 * 10 * 14 * 16;
 
 pub fn mpmc_sync(num_threads: usize) {
     struct Queue {
@@ -57,7 +62,7 @@ pub fn mpmc_sync(num_threads: usize) {
 
     let sum = Arc::new(AtomicU64::new(0));
 
-    let num_enqueue_dequeue = NUM_ENQUEUE_DEQUEUE / (num_threads / 2);
+    let num_enqueue_dequeue = NUM_TX / (num_threads / 2);
     for thread_idx in 0..num_threads {
         let start_barrier = start_barrier.clone();
         let shared_queue = shared_queue.clone();
@@ -185,7 +190,7 @@ pub fn mpmc_tx(num_threads: usize) {
 
     let sum = Arc::new(AtomicU64::new(0));
 
-    let num_enqueue_dequeue = NUM_ENQUEUE_DEQUEUE / (num_threads / 2);
+    let num_enqueue_dequeue = NUM_TX / (num_threads / 2);
     for thread_idx in 0..num_threads {
         let start_barrier = start_barrier.clone();
         let shared_queue = shared_queue.clone();
@@ -254,17 +259,336 @@ pub fn mpmc_tx(num_threads: usize) {
     );
 }
 
+const MAP_SZ: usize = 100;
+const TAKE_COUNT: usize = 5;
+const HOT_PERCENTAGE: f64 = 0.9;
+const NUM_HOT: usize = 10;
+
+pub fn uniform_sync(num_threads: usize) {
+    let mut shared_map = HashMap::new();
+    let mut keys = Vec::new();
+    for i in 0..MAP_SZ {
+        shared_map.insert(i, Mutex::new(1));
+        keys.push(i);
+    }
+    let shared_map = Arc::new(shared_map);
+    let keys = Arc::new(keys);
+
+    let mut handles = Vec::with_capacity(num_threads);
+    let start_barrier = Arc::new((Mutex::new(false), Condvar::new()));
+
+    for thread_idx in 0..num_threads {
+        let start_barrier = start_barrier.clone();
+        let shared_map = shared_map.clone();
+        let keys = keys.clone();
+        handles.push(std::thread::spawn(move || {
+            {
+                let mut start_barrier_guard = start_barrier.0.lock();
+                if !*start_barrier_guard {
+                    start_barrier.1.wait(&mut start_barrier_guard);
+                }
+            }
+
+            let mut rand = rand_xoshiro::Xoroshiro128PlusPlus::seed_from_u64(thread_idx as u64);
+            for _ in 0..NUM_TX {
+                let mut to_lock: Vec<_> = keys
+                    .as_slice()
+                    .choose_multiple(&mut rand, TAKE_COUNT)
+                    .cloned()
+                    .collect();
+                let to_set = to_lock[0];
+                to_lock.sort_unstable();
+                to_lock.dedup();
+                let write_idx = to_lock
+                    .iter()
+                    .cloned()
+                    .position(|key| key == to_set)
+                    .unwrap();
+                let mut locks: Vec<_> = to_lock
+                    .iter()
+                    .cloned()
+                    .map(|key| shared_map.get(&key).unwrap().lock())
+                    .collect();
+                let mut sum = 0;
+                for lock in &locks {
+                    let val: usize = **lock;
+                    sum = val;
+                }
+                *locks[write_idx] = sum;
+            }
+        }));
+    }
+
+    {
+        let mut start_barrier_guard = start_barrier.0.lock();
+        *start_barrier_guard = true;
+        start_barrier.1.notify_all();
+    }
+
+    handles
+        .into_iter()
+        .for_each(|handle| handle.join().unwrap());
+}
+
+pub fn uniform_tx(num_threads: usize) {
+    let mut shared_map = HashMap::new();
+    let mut keys = Vec::new();
+    for i in 0..MAP_SZ {
+        shared_map.insert(i, TxNonblockingData::new(0));
+        keys.push(i);
+    }
+    let shared_map = Arc::new(shared_map);
+    let keys = Arc::new(keys);
+
+    let mut handles = Vec::with_capacity(num_threads);
+    let start_barrier = Arc::new((Mutex::new(false), Condvar::new()));
+
+    for thread_idx in 0..num_threads {
+        let start_barrier = start_barrier.clone();
+        let shared_map = shared_map.clone();
+        let keys = keys.clone();
+        handles.push(std::thread::spawn(move || {
+            {
+                let mut start_barrier_guard = start_barrier.0.lock();
+                if !*start_barrier_guard {
+                    start_barrier.1.wait(&mut start_barrier_guard);
+                }
+            }
+
+            let mut rand = rand_xoshiro::Xoroshiro128PlusPlus::seed_from_u64(thread_idx as u64);
+
+            block_on(async move {
+                for _ in 0..NUM_TX {
+                    let mut to_lock: Vec<_> = keys
+                        .as_slice()
+                        .choose_multiple(&mut rand, TAKE_COUNT)
+                        .cloned()
+                        .collect();
+                    let to_set = to_lock[0];
+                    to_lock.sort_unstable();
+                    to_lock.dedup();
+                    let write_idx = to_lock
+                        .iter()
+                        .cloned()
+                        .position(|key| key == to_set)
+                        .unwrap();
+
+                    loop {
+                        let mut data_handles: Vec<TxDataHandle<_>> = to_lock
+                            .iter()
+                            .map(|key| shared_map.get(key).unwrap().handle())
+                            .collect();
+                        let res = async_tx!({
+                            let mut sum = 0;
+                            for data_handle in &mut data_handles {
+                                sum += *data_handle.read().await;
+                            }
+                            data_handles[write_idx].set(sum).await;
+                        })
+                        .await;
+
+                        if let Ok(()) = res {
+                            break;
+                        }
+                    }
+                }
+            });
+        }));
+    }
+
+    {
+        let mut start_barrier_guard = start_barrier.0.lock();
+        *start_barrier_guard = true;
+        start_barrier.1.notify_all();
+    }
+
+    handles
+        .into_iter()
+        .for_each(|handle| handle.join().unwrap());
+}
+
+pub fn hot_cold_sync(num_threads: usize) {
+    let mut shared_map = HashMap::new();
+    let mut keys = Vec::new();
+    for i in 0..MAP_SZ {
+        shared_map.insert(i, Mutex::new(1));
+        keys.push(i);
+    }
+    let shared_map = Arc::new(shared_map);
+
+    let mut handles = Vec::with_capacity(num_threads);
+    let start_barrier = Arc::new((Mutex::new(false), Condvar::new()));
+
+    for thread_idx in 0..num_threads {
+        let start_barrier = start_barrier.clone();
+        let shared_map = shared_map.clone();
+        handles.push(std::thread::spawn(move || {
+            {
+                let mut start_barrier_guard = start_barrier.0.lock();
+                if !*start_barrier_guard {
+                    start_barrier.1.wait(&mut start_barrier_guard);
+                }
+            }
+
+            let mut rand = rand_xoshiro::Xoroshiro128PlusPlus::seed_from_u64(thread_idx as u64);
+            for _ in 0..NUM_TX {
+                let mut to_lock = Vec::new();
+                for _ in 0..NUM_HOT {
+                    if rand.gen::<f64>() < HOT_PERCENTAGE {
+                        let hot_idx = rand.gen::<usize>() % NUM_HOT;
+                        to_lock.push(hot_idx);
+                    } else {
+                        let cold_idx = (rand.gen::<usize>() % (MAP_SZ - NUM_HOT)) + NUM_HOT;
+                        to_lock.push(cold_idx);
+                    }
+                }
+
+                let to_set = to_lock[0];
+                to_lock.sort_unstable();
+                to_lock.dedup();
+                let write_idx = to_lock
+                    .iter()
+                    .cloned()
+                    .position(|key| key == to_set)
+                    .unwrap();
+                let mut locks: Vec<_> = to_lock
+                    .iter()
+                    .cloned()
+                    .map(|key| shared_map.get(&key).unwrap().lock())
+                    .collect();
+                let mut sum = 0;
+                for lock in &locks {
+                    let val: usize = **lock;
+                    sum = val;
+                }
+                *locks[write_idx] = sum;
+            }
+        }));
+    }
+
+    {
+        let mut start_barrier_guard = start_barrier.0.lock();
+        *start_barrier_guard = true;
+        start_barrier.1.notify_all();
+    }
+
+    handles
+        .into_iter()
+        .for_each(|handle| handle.join().unwrap());
+}
+
+pub fn hot_cold_tx(num_threads: usize) {
+    let mut shared_map = HashMap::new();
+    let mut keys = Vec::new();
+    for i in 0..MAP_SZ {
+        shared_map.insert(i, TxNonblockingData::new(0));
+        keys.push(i);
+    }
+    let shared_map = Arc::new(shared_map);
+
+    let mut handles = Vec::with_capacity(num_threads);
+    let start_barrier = Arc::new((Mutex::new(false), Condvar::new()));
+
+    for thread_idx in 0..num_threads {
+        let start_barrier = start_barrier.clone();
+        let shared_map = shared_map.clone();
+        handles.push(std::thread::spawn(move || {
+            {
+                let mut start_barrier_guard = start_barrier.0.lock();
+                if !*start_barrier_guard {
+                    start_barrier.1.wait(&mut start_barrier_guard);
+                }
+            }
+
+            let mut rand = rand_xoshiro::Xoroshiro128PlusPlus::seed_from_u64(thread_idx as u64);
+
+            block_on(async move {
+                for _ in 0..NUM_TX {
+                    let mut to_lock = Vec::new();
+                    for _ in 0..NUM_HOT {
+                        if rand.gen::<f64>() < HOT_PERCENTAGE {
+                            let hot_idx = rand.gen::<usize>() % NUM_HOT;
+                            to_lock.push(hot_idx);
+                        } else {
+                            let cold_idx = (rand.gen::<usize>() % (MAP_SZ - NUM_HOT)) + NUM_HOT;
+                            to_lock.push(cold_idx);
+                        }
+                    }
+
+                    let to_set = to_lock[0];
+                    to_lock.sort_unstable();
+                    to_lock.dedup();
+                    let write_idx = to_lock
+                        .iter()
+                        .cloned()
+                        .position(|key| key == to_set)
+                        .unwrap();
+
+                    loop {
+                        let mut data_handles: Vec<TxDataHandle<_>> = to_lock
+                            .iter()
+                            .map(|key| shared_map.get(key).unwrap().handle())
+                            .collect();
+                        let res = async_tx!({
+                            let mut sum = 0;
+                            for data_handle in &mut data_handles {
+                                sum += *data_handle.read().await;
+                            }
+                            data_handles[write_idx].set(sum).await;
+                        })
+                        .await;
+
+                        if let Ok(()) = res {
+                            break;
+                        }
+                    }
+                }
+            });
+        }));
+    }
+
+    {
+        let mut start_barrier_guard = start_barrier.0.lock();
+        *start_barrier_guard = true;
+        start_barrier.1.notify_all();
+    }
+
+    handles
+        .into_iter()
+        .for_each(|handle| handle.join().unwrap());
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{mpmc_sync, mpmc_tx};
+    use super::*;
 
     #[test]
-    fn run_two_sync() {
+    fn run_two_mpmc_sync() {
         mpmc_sync(2);
     }
 
     #[test]
-    fn run_two_tx() {
+    fn run_two_mpmc_tx() {
         mpmc_tx(2);
+    }
+
+    #[test]
+    fn run_two_uniform_sync() {
+        uniform_sync(2);
+    }
+
+    #[test]
+    fn run_two_uniform_tx() {
+        uniform_tx(2);
+    }
+
+    #[test]
+    fn run_two_hot_cold_sync() {
+        hot_cold_sync(2);
+    }
+
+    #[test]
+    fn run_two_hot_cold_tx() {
+        hot_cold_tx(2);
     }
 }
