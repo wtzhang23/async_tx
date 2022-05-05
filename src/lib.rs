@@ -4,6 +4,8 @@ pub mod log;
 pub mod runtime;
 pub mod transaction;
 
+pub mod bench;
+
 pub use crate::{
     context::CommitGuard,
     data::{TxBlockingData, TxNonblockingData},

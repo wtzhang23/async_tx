@@ -7,14 +7,17 @@ edition = "2021"
 
 [dependencies]
 crossbeam = "^0.8"
+futures = "^0.3"
 lock_api = "^0.4"
 parking_lot = "^0.12"
 
 [dev-dependencies]
 async-std = "^1.11"
 criterion = "^0.3"
-futures = "^0.3"
+rand = {version="^0.8", features=["std"]}
+rand_xoshiro = "^0.6"
 
-# [[bench]]
-# name = "kv_store"
-# harness = false
+
+[[bench]]
+name = "mpmc"
+harness = false
